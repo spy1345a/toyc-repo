@@ -2,24 +2,45 @@
 
 import subprocess
 import os
+import time
 import array
+import threading
 import vulkan as vk
 import cffi
 
 SHADER_PATH = os.path.join(os.path.dirname(__file__), "shaders", "executor.comp")
 SPV_PATH    = SHADER_PATH + ".spv"
 
+_spv_cache = None
+_spv_lock  = threading.Lock()
+
 
 def compile_shader():
-    """Compile GLSL → SPIR-V using glslc."""
-    result = subprocess.run(
-        ["glslc", SHADER_PATH, "-o", SPV_PATH],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"glslc failed:\n{result.stderr}")
-    with open(SPV_PATH, "rb") as f:
-        return f.read()
+    """Compile GLSL → SPIR-V using glslc.
+
+    Cached in memory and on disk: glslc only runs when the cached .spv is
+    missing or older than the .glsl source.
+    """
+    global _spv_cache
+    with _spv_lock:
+        if _spv_cache is not None:
+            return _spv_cache
+
+        up_to_date = (
+            os.path.exists(SPV_PATH)
+            and os.path.getmtime(SPV_PATH) >= os.path.getmtime(SHADER_PATH)
+        )
+        if not up_to_date:
+            result = subprocess.run(
+                ["glslc", SHADER_PATH, "-o", SPV_PATH],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"glslc failed:\n{result.stderr}")
+
+        with open(SPV_PATH, "rb") as f:
+            _spv_cache = f.read()
+        return _spv_cache
 
 
 def find_memory_type(physical_device, type_filter, properties):
@@ -69,6 +90,7 @@ def make_buffer(device, physical_device, data_list, dtype="int"):
 
 class GPUExecutor:
     def __init__(self):
+        self.last_timings = {}
         self._init_vulkan()
 
     def _init_vulkan(self):
@@ -112,12 +134,19 @@ class GPUExecutor:
         flat_instructions : list of ints   e.g [5,0,0,0, 5,1,1,0, ...]
         constants         : list of floats e.g [2.0]
         variables         : list of floats e.g [10.0, 5.0]
-        """
 
-        # ── compile shader ─────────────────────────────────────────────
+        Per-call stage timings (ms) are stored in self.last_timings with keys:
+        compile, buffers, setup, dispatch, readback.
+        """
+        t = {}
+
+        # ── compile shader (cached) ────────────────────────────────────
+        t0 = time.perf_counter()
         spv = compile_shader()
+        t["compile"] = (time.perf_counter() - t0) * 1000.0
 
         # ── create buffers + track their sizes ────────────────────────
+        t0 = time.perf_counter()
         instr_buf, instr_mem, instr_size = make_buffer(
             self.device, self.physical_device, flat_instructions, "int"
         )
@@ -130,8 +159,10 @@ class GPUExecutor:
         res_buf,   res_mem,   res_size   = make_buffer(
             self.device, self.physical_device, [0.0], "float"
         )
+        t["buffers"] = (time.perf_counter() - t0) * 1000.0
 
         # ── descriptor set layout ─────────────────────────────────────
+        t0 = time.perf_counter()
         bindings = [
             vk.VkDescriptorSetLayoutBinding(
                 binding         = i,
@@ -246,8 +277,10 @@ class GPUExecutor:
         )
         vk.vkCmdDispatch(cmd_buf, 1, 1, 1)
         vk.vkEndCommandBuffer(cmd_buf)
+        t["setup"] = (time.perf_counter() - t0) * 1000.0
 
-        # submit + wait
+        # ── submit + wait ─────────────────────────────────────────────
+        t0 = time.perf_counter()
         fence = vk.vkCreateFence(self.device, vk.VkFenceCreateInfo(), None)
         vk.vkQueueSubmit(
             self.queue,
@@ -262,11 +295,15 @@ class GPUExecutor:
             True,
             int(1e9)
         )
+        t["dispatch"] = (time.perf_counter() - t0) * 1000.0
 
         # ── read back result ──────────────────────────────────────────
+        t0 = time.perf_counter()
         ptr        = vk.vkMapMemory(self.device, res_mem, 0, res_size, 0)
         data_bytes = bytes(ptr)
         out        = array.array("f", data_bytes)
         vk.vkUnmapMemory(self.device, res_mem)
+        t["readback"] = (time.perf_counter() - t0) * 1000.0
 
+        self.last_timings = t
         return out[0]

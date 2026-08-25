@@ -1,31 +1,42 @@
 #version 450
 
-layout(local_size_x = 1) in;
+layout(local_size_x = 64) in;
 
 // buffer 0 — flat instruction list [op, dest, src1, src2, ...]
+// shared by every invocation; each invocation evaluates one instance
 layout(set=0, binding=0) readonly buffer Instructions {
     int instr[];
 };
 
-// buffer 1 — constant pool e.g [2.0]
+// buffer 1 — constant pool followed by metadata:
+//   [... pool ..., num_vars, batch_count]
 layout(set=0, binding=1) readonly buffer Constants {
     float constants[];
 };
 
-// buffer 2 — variable values e.g [10.0, 5.0]
+// buffer 2 — variable values, row-major: instance i, var j ->
+//            variables[i * num_vars + j]
 layout(set=0, binding=2) readonly buffer Variables {
     float variables[];
 };
 
-// buffer 3 — result written here
+// buffer 3 — one result per instance: result[instance]
 layout(set=0, binding=3) buffer Result {
     float result[];
 };
 
-// register file — 64 registers
+// register file — 64 registers (per invocation)
 float regs[64];
 
 void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    uint meta       = uint(constants.length());
+    int  num_vars   = int(constants[meta - 2]);
+    int  batch_size = int(constants[meta - 1]);
+
+    if (gid >= uint(batch_size)) return;
+
     int n = int(instr.length()) / 4;
 
     for (int i = 0; i < n; i++) {
@@ -38,11 +49,10 @@ void main() {
         else if (op == 1) regs[dest] = regs[src1] - regs[src2]; // SUB
         else if (op == 2) regs[dest] = regs[src1] * regs[src2]; // MUL
         else if (op == 3) regs[dest] = regs[src1] / regs[src2]; // DIV
-        else if (op == 4) regs[dest] = constants[src1];          // LOAD
-        else if (op == 5) regs[dest] = variables[src1];          // VAR
+        else if (op == 4) regs[dest] = constants[src1];         // LOAD
+        else if (op == 5) regs[dest] = variables[uint(gid) * uint(num_vars) + uint(src1)]; // VAR
     }
 
-    // last instruction's dest register holds the final result
     int last_dest = instr[(n-1)*4 + 1];
-    result[0] = regs[last_dest];
+    result[gid] = regs[last_dest];
 }

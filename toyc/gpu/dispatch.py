@@ -389,5 +389,20 @@ class GPUExecutor:
         t["readback"]  = (time.perf_counter() - t0) * 1000.0
         t["gpu_exec"]  = (ts_end - ts_start) * self.timestamp_period / 1e6
 
+        # ── free per-call resources (they are rebuilt on every run) ───
+        with _vk_api_lock:
+            vk.vkDestroyFence(self.device, fence, None)
+            vk.vkDestroyCommandPool(self.device, cmd_pool, None)
+            vk.vkDestroyDescriptorPool(self.device, desc_pool, None)
+            vk.vkDestroyDescriptorSetLayout(self.device, desc_set_layout,
+                                            None)
+            vk.vkDestroyPipeline(self.device, pipeline, None)
+            vk.vkDestroyPipelineLayout(self.device, pipeline_layout, None)
+            vk.vkDestroyShaderModule(self.device, shader_module, None)
+            for buf, mem in ((instr_buf, instr_mem), (const_buf, const_mem),
+                             (var_buf, var_mem), (res_buf, res_mem)):
+                vk.vkDestroyBuffer(self.device, buf, None)
+                vk.vkFreeMemory(self.device, mem, None)
+
         self.last_timings = t
         return list(out)

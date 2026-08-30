@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "toyc"
-version = "0.1.1"
+version = "0.1.2"
 description = "A toy compiler with GPU backends (Vulkan + OpenGL)"
 readme = "README.md"
 license = { file = "toyc/LICENSE" }
@@ -34,6 +34,6 @@ Repository = "https://github.com/spy1345a/toyc-repo"
 vulkan = ["vulkan"]     
 opengl = ["PyOpenGL"]
 
-# If you want a CLI entrypoint (e.g. `toyc compile foo.tc`): comming soon
+# If you want a CLI entrypoint (e.g. `toyc compile foo.tc`): comming soon or not , who knows
 # [project.scripts]
 # toyc = "toyc.compiler:main"

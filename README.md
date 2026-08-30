@@ -13,6 +13,8 @@ pip install toyc
 - **Lexer / Parser / AST** — tokenizes and parses a simple toy language
 - **Evaluator** — tree-walk interpreter
 - **VM** — bytecode virtual machine
+
+## To do 
 - **GPU backends** — Vulkan and OpenGL compute backends via `toyc.gpu`
 
 ## Usage
@@ -20,7 +22,7 @@ pip install toyc
 ```python
 from toyc import compiler
 
-# example usage here once you have a public API
+
 ```
 
 ## License

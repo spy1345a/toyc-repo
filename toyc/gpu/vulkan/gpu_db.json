@@ -1,0 +1,248 @@
+{
+  "0": {
+    "index": 0,
+    "name": "AMD Radeon RX 580 2048SP (RADV POLARIS10)",
+    "device_type": "discrete",
+    "vendor_id": 4098,
+    "device_id": 28639,
+    "driver_version": "26.2.1",
+    "api_version": "1.4.354",
+    "queue_families": [
+      {
+        "index": 0,
+        "queue_count": 1,
+        "flags": [
+          "GRAPHICS",
+          "COMPUTE",
+          "TRANSFER",
+          "SPARSE_BINDING"
+        ],
+        "timestamp_valid_bits": 64,
+        "min_image_transfer_granularity": {
+          "width": 1,
+          "height": 1,
+          "depth": 1
+        }
+      },
+      {
+        "index": 1,
+        "queue_count": 4,
+        "flags": [
+          "COMPUTE",
+          "TRANSFER",
+          "SPARSE_BINDING"
+        ],
+        "timestamp_valid_bits": 64,
+        "min_image_transfer_granularity": {
+          "width": 1,
+          "height": 1,
+          "depth": 1
+        }
+      },
+      {
+        "index": 2,
+        "queue_count": 1,
+        "flags": [
+          "SPARSE_BINDING"
+        ],
+        "timestamp_valid_bits": 0,
+        "min_image_transfer_granularity": {
+          "width": 1,
+          "height": 1,
+          "depth": 1
+        }
+      }
+    ],
+    "memory_heaps": [
+      {
+        "index": 0,
+        "size_bytes": 8321499136,
+        "size_mb": 7936.0,
+        "flags": [
+          "DEVICE_LOCAL"
+        ]
+      },
+      {
+        "index": 1,
+        "size_bytes": 8348200960,
+        "size_mb": 7961.46,
+        "flags": []
+      },
+      {
+        "index": 2,
+        "size_bytes": 268435456,
+        "size_mb": 256.0,
+        "flags": [
+          "DEVICE_LOCAL"
+        ]
+      }
+    ],
+    "memory_types": [
+      {
+        "index": 0,
+        "heap_index": 0,
+        "flags": [
+          "DEVICE_LOCAL"
+        ]
+      },
+      {
+        "index": 1,
+        "heap_index": 0,
+        "flags": [
+          "DEVICE_LOCAL"
+        ]
+      },
+      {
+        "index": 2,
+        "heap_index": 1,
+        "flags": [
+          "HOST_VISIBLE",
+          "HOST_COHERENT"
+        ]
+      },
+      {
+        "index": 3,
+        "heap_index": 2,
+        "flags": [
+          "DEVICE_LOCAL",
+          "HOST_VISIBLE",
+          "HOST_COHERENT"
+        ]
+      },
+      {
+        "index": 4,
+        "heap_index": 2,
+        "flags": [
+          "DEVICE_LOCAL",
+          "HOST_VISIBLE",
+          "HOST_COHERENT"
+        ]
+      },
+      {
+        "index": 5,
+        "heap_index": 1,
+        "flags": [
+          "HOST_VISIBLE",
+          "HOST_COHERENT",
+          "HOST_CACHED"
+        ]
+      },
+      {
+        "index": 6,
+        "heap_index": 1,
+        "flags": [
+          "HOST_VISIBLE",
+          "HOST_COHERENT",
+          "HOST_CACHED"
+        ]
+      }
+    ],
+    "limits": {
+      "maxImageDimension1D": 16384,
+      "maxImageDimension2D": 16384,
+      "maxImageDimension3D": 2048,
+      "maxImageDimensionCube": 16384,
+      "maxImageArrayLayers": 2048,
+      "maxTexelBufferElements": 536870912,
+      "maxUniformBufferRange": 4294967295,
+      "maxStorageBufferRange": 4294967295,
+      "maxPushConstantsSize": 256,
+      "maxMemoryAllocationCount": 4294967295,
+      "maxSamplerAllocationCount": 65536,
+      "maxBoundDescriptorSets": 32,
+      "maxPerStageDescriptorSamplers": 8388606,
+      "maxPerStageDescriptorUniformBuffers": 8388606,
+      "maxPerStageDescriptorStorageBuffers": 8388606,
+      "maxDescriptorSetStorageBuffers": 8388606,
+      "maxComputeSharedMemorySize": 65536,
+      "maxComputeWorkGroupCount": [
+        4294967295,
+        65535,
+        65535
+      ],
+      "maxComputeWorkGroupInvocations": 1024,
+      "maxComputeWorkGroupSize": [
+        1024,
+        1024,
+        1024
+      ],
+      "subPixelPrecisionBits": 8,
+      "mipmapPrecisionBits": 8,
+      "maxDrawIndexedIndexValue": 4294967295,
+      "maxDrawIndirectCount": 4294967295,
+      "maxSamplerLodBias": 16.0,
+      "maxSamplerAnisotropy": 16.0,
+      "maxViewports": 16,
+      "maxViewportDimensions": [
+        16384,
+        16384
+      ],
+      "minMemoryMapAlignment": 4096,
+      "minTexelBufferOffsetAlignment": 4,
+      "minUniformBufferOffsetAlignment": 4,
+      "minStorageBufferOffsetAlignment": 4,
+      "optimalBufferCopyOffsetAlignment": 1,
+      "optimalBufferCopyRowPitchAlignment": 1,
+      "nonCoherentAtomSize": 64,
+      "timestampComputeAndGraphics": true,
+      "timestampPeriod": 40.0
+    },
+    "features": {
+      "robustBufferAccess": true,
+      "fullDrawIndexUint32": true,
+      "imageCubeArray": true,
+      "independentBlend": true,
+      "geometryShader": true,
+      "tessellationShader": true,
+      "sampleRateShading": true,
+      "dualSrcBlend": true,
+      "logicOp": true,
+      "multiDrawIndirect": true,
+      "drawIndirectFirstInstance": true,
+      "depthClamp": true,
+      "depthBiasClamp": true,
+      "fillModeNonSolid": true,
+      "depthBounds": true,
+      "wideLines": true,
+      "largePoints": true,
+      "alphaToOne": true,
+      "multiViewport": true,
+      "samplerAnisotropy": true,
+      "textureCompressionETC2": false,
+      "textureCompressionASTC_LDR": false,
+      "textureCompressionBC": true,
+      "occlusionQueryPrecise": true,
+      "pipelineStatisticsQuery": true,
+      "vertexPipelineStoresAndAtomics": true,
+      "fragmentStoresAndAtomics": true,
+      "shaderTessellationAndGeometryPointSize": true,
+      "shaderImageGatherExtended": true,
+      "shaderStorageImageExtendedFormats": true,
+      "shaderStorageImageMultisample": true,
+      "shaderStorageImageReadWithoutFormat": true,
+      "shaderStorageImageWriteWithoutFormat": true,
+      "shaderUniformBufferArrayDynamicIndexing": true,
+      "shaderSampledImageArrayDynamicIndexing": true,
+      "shaderStorageBufferArrayDynamicIndexing": true,
+      "shaderStorageImageArrayDynamicIndexing": true,
+      "shaderClipDistance": true,
+      "shaderCullDistance": true,
+      "shaderFloat64": true,
+      "shaderInt64": true,
+      "shaderInt16": true,
+      "shaderResourceResidency": true,
+      "shaderResourceMinLod": true,
+      "sparseBinding": true,
+      "sparseResidencyBuffer": true,
+      "sparseResidencyImage2D": true,
+      "sparseResidencyImage3D": true,
+      "sparseResidency2Samples": false,
+      "sparseResidency4Samples": false,
+      "sparseResidency8Samples": false,
+      "sparseResidency16Samples": false,
+      "sparseResidencyAliased": true,
+      "variableMultisampleRate": true,
+      "inheritedQueries": true
+    }
+  }
+}

@@ -37,6 +37,14 @@ Cpu.run(program="program.toy")
 
 ```
 
+# Gpu detection (not compliling yet, andno opengl vulkan only)
+```python
+from toyc import gpu.GpuValkan
+
+db = gpu.Gpuvalkan
+```
+ps: you can call it it wont print anything yet, iam still wokrcing on the class and its function
+
 ## License
 
 See [LICENSE](toyc/LICENSE).

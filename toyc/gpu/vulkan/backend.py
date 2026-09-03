@@ -7,23 +7,23 @@
 #   DIV   → OpFDiv
 
 #__________self created imports____________
-from gpu_detect import detect, save, load, select_device, suggest_batch_size
+import gpu_detect
 
 #__________________________________________
 
 import vulkan as vk
 
-# First run — detect and cache
-db = detect(verbose=True)
-save(db)
+# detect all GPUs (auto-saves JSON next to script)
+db = gpu_detect.detect()
 
-# Later runs — load from cache
-db = load()
+# pick the best GPU
+best = gpu_detect.select_device(db)
 
-# Pick the best device and calculate batch size
-dev = select_device(db, prefer="discrete")
-batch = suggest_batch_size(dev, element_bytes=4 * 1024 * 1024)  # 4 MB per item
-print(batch)
+# get batch size — prints + returns
+n = gpu_detect.batch(best)
+
+# n is now just an int you can use
+print(f"will process {n} elements per batch")
 
 class GpuVulkan:
     pass

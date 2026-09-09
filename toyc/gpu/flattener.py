@@ -1,4 +1,4 @@
-# compiler/flattener.py
+# toyc/flattener.py
 
 from ..ast_nodes    import Number, Var, BinOp
 from .instructions import Instruction, ADD, SUB, MUL, DIV, LOAD, VAR

@@ -29,7 +29,7 @@ from .compiler import (
 from .lexer  import Lexer
 from .parser import Parser
 
-# Re-export so `from compiler.vm import GpuVulkan` works
+# Re-export so `from compiler.vm import GpuVulkan` works for reimpotint only not used for anything else even in the vm
 from .gpu.vulkan import GpuVulkan
 
 from .gpu.opengl import GpuOpengl

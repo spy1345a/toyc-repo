@@ -35,7 +35,9 @@ from typing import Any
 try:
     import vulkan as vk
     _VULKAN_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
+    # OSError: bindings present but loader/SDK missing (vulkan raises
+    # OSError when libvulkan cannot be found).
     _VULKAN_AVAILABLE = False
 
 # Directory that contains this script — all JSON files land here.

@@ -3,9 +3,41 @@ import os
 import struct
 import threading
 import time
+import warnings
 from typing import Any
 
-import vulkan as vk
+try:
+    import vulkan as vk
+    _VULKAN_AVAILABLE = True
+    _VULKAN_IMPORT_ERROR = None
+except (ImportError, OSError) as _exc:
+    # Missing bindings OR missing loader/SDK (vulkan raises OSError
+    # when libvulkan/Vulkan SDK can't be found). The CPU backend does
+    # not need Vulkan, so importing toyc must keep working — GPU entry
+    # points raise a clear error via _require_vulkan() instead.
+    vk = None  # type: ignore
+    _VULKAN_AVAILABLE = False
+    _VULKAN_IMPORT_ERROR = _exc
+    warnings.warn(
+        "Vulkan SDK/loader not found — GpuVulkan is unavailable and "
+        "any GPU call will raise RuntimeError; the CPU backend works "
+        "normally. Install a Vulkan driver + SDK for GPU support "
+        f"(import failed with: {_exc})",
+        UserWarning,
+        stacklevel=2,
+    )
+
+_NO_VULKAN_MSG = (
+    "Vulkan SDK/loader not found, so the GPU backend cannot run. "
+    "Use the CPU backend (Cpu.run), or install a Vulkan driver and SDK. "
+    "See https://vulkan.lunarg.com/sdk/home"
+)
+
+
+def _require_vulkan() -> None:
+    """Raise a friendly error if the Vulkan binding/loader is missing."""
+    if not _VULKAN_AVAILABLE:
+        raise RuntimeError(_NO_VULKAN_MSG)
 
 from . import gpu_detect
 from .. import flattener
@@ -82,6 +114,7 @@ class GpuVulkan:
     @staticmethod
     def _sel_gpu(debug: bool = False):
         """Return (DeviceProfile, batch_size) for the best available GPU."""
+        _require_vulkan()
         gpu_db = GpuVulkan._get_db(debug=debug)
 
         if not gpu_db:
@@ -155,6 +188,7 @@ class GpuVulkan:
         tear it down — until shutdown() or process exit. Returns the
         selected DeviceProfile.
         """
+        _require_vulkan()
         profile, _ = GpuVulkan._sel_gpu(debug=debug)
         with _CTX_LOCK:
             GpuVulkan._get_ctx(profile, debug=debug)
@@ -227,6 +261,7 @@ class GpuVulkan:
         Returns a plain namespace with all handles needed for dispatch and
         teardown.
         """
+        _require_vulkan()
         # instance — include sType so strict loaders (RADV) accept it.
         app_info = vk.VkApplicationInfo(
             sType=vk.VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -910,6 +945,7 @@ class GpuVulkan:
             raise ValueError(f"Expected a .toy source file, got: {program!r}")
         if not os.path.isfile(program):
             raise FileNotFoundError(f"Source file not found: {program!r}")
+        _require_vulkan()
 
         t_start = time.perf_counter() if timed else 0.0
         flat_data = GpuVulkan._to_flat(program, env)
@@ -958,6 +994,7 @@ class GpuVulkan:
             raise ValueError(f"Expected a .toy source file, got: {program!r}")
         if not os.path.isfile(program):
             raise FileNotFoundError(f"Source file not found: {program!r}")
+        _require_vulkan()
 
         results, timing = GpuVulkan._run_batch_core(
             program, env, debug=debug, timed=timed)
@@ -1024,6 +1061,7 @@ class GpuVulkan:
         if program.endswith(".toy"):
             if not os.path.isfile(program):
                 raise FileNotFoundError(f"Source file not found: {program!r}")
+            _require_vulkan()
             flat_data = GpuVulkan._to_flat(program, env)
             t_flat = time.perf_counter() if timed else 0.0
             if timed:
@@ -1040,6 +1078,7 @@ class GpuVulkan:
         elif not program.endswith(".toyc") and not os.path.isfile(program):
             # Inline expression, e.g. GpuVulkan.run("1 + 2"). No file to
             # cache next to, so nothing is written.
+            _require_vulkan()
             flat_data = GpuVulkan._flat_from_source(program, env)
             t_flat = time.perf_counter() if timed else 0.0
             if timed:
@@ -1070,6 +1109,7 @@ class GpuVulkan:
                         raise RuntimeError(
                             f"Bytecode file is empty: {toyc_path!r}"
                         )
+                    _require_vulkan()
                     instructions = list(struct.unpack(f"{n}i", raw[:n * 4]))
                     if timed:
                         result, stages = GpuVulkan._eval_flat_timed(
@@ -1093,6 +1133,7 @@ class GpuVulkan:
                     return result, timing
                 return result
             elif isinstance(raw, list) and raw and isinstance(raw[0], int):
+                _require_vulkan()
                 if timed:
                     result, stages = GpuVulkan._eval_flat_timed(
                         list(raw), debug=debug)

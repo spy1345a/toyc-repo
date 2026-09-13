@@ -373,6 +373,7 @@ def detect(
     verbose: bool = False,
     element_bytes: int = _DEFAULT_ELEMENT_BYTES,
     overhead_factor: float = _DEFAULT_OVERHEAD,
+    debug: bool = False,
 ) -> dict[int, "DeviceProfile"]:
     """
     Enumerate all Vulkan physical devices and return a dict
@@ -388,6 +389,7 @@ def detect(
     verbose        : bool  – print a summary table to stdout
     element_bytes  : int   – bytes per work item used for batch recommendation
     overhead_factor: float – fraction of VRAM to target (default 0.80)
+    debug          : bool  – alias for verbose; print diagnostics to stdout
 
     Returns
     -------
@@ -432,7 +434,7 @@ def detect(
 
         cached = _load_profile(raw_name)
         if cached is not None:
-            if verbose:
+            if verbose or debug:
                 print(f"  [{idx}] {raw_name}  → loaded from cache "
                       f"({_gpu_json_path(raw_name).name})")
             db[idx] = cached
@@ -444,13 +446,13 @@ def detect(
             profile, element_bytes, overhead_factor
         )
         path = _save_profile(profile)
-        if verbose:
+        if verbose or debug:
             print(f"  [{idx}] {profile.name}  → saved to {path.name}")
         db[idx] = profile
 
     vk.vkDestroyInstance(instance, None)
 
-    if verbose:
+    if verbose or debug:
         _print_summary(db)
 
     return db
@@ -460,17 +462,18 @@ def batch(
     profile: "DeviceProfile",
     element_bytes: int = _DEFAULT_ELEMENT_BYTES,
     overhead_factor: float = _DEFAULT_OVERHEAD,
+    debug: bool = False,
 ) -> int:
     """
-    Return the recommended batch size for *profile*, printing it at the
-    same time.  If profile.recommended_batch is already set (e.g. loaded
-    from cache), that value is used directly; otherwise it is computed,
-    stored on the profile, and the JSON cache is updated.
+    Return the recommended batch size for *profile*.  If
+    profile.recommended_batch is already set (e.g. loaded from cache),
+    that value is used directly; otherwise it is computed, stored on
+    the profile, and the JSON cache is updated.
 
-    Assigning the return value and printing are both done in one call::
+    The human-readable report is printed only when debug=True::
 
-        n = gpu_detect.batch(profile)           # prints + returns
-        print(n)                                 # still just the int
+        n = gpu_detect.batch(profile)                 # silent, just returns
+        n = gpu_detect.batch(profile, debug=True)     # prints + returns
     """
     if profile.recommended_batch:
         size = profile.recommended_batch
@@ -480,15 +483,16 @@ def batch(
         # update the JSON so the field is not missing next load
         _save_profile(profile)
 
-    vram_mb = profile.total_device_local_memory_mb
-    elem_mb = element_bytes / (1024 ** 2)
-    print(
-        f"Recommended batch  : {size:,} element(s)\n"
-        f"  GPU              : [{profile.index}] {profile.name}\n"
-        f"  VRAM             : {vram_mb:,.0f} MB  (device-local)\n"
-        f"  Element size     : {elem_mb:.1f} MB\n"
-        f"  Target occupancy : {overhead_factor * 100:.0f} %"
-    )
+    if debug:
+        vram_mb = profile.total_device_local_memory_mb
+        elem_mb = element_bytes / (1024 ** 2)
+        print(
+            f"Recommended batch  : {size:,} element(s)\n"
+            f"  GPU              : [{profile.index}] {profile.name}\n"
+            f"  VRAM             : {vram_mb:,.0f} MB  (device-local)\n"
+            f"  Element size     : {elem_mb:.1f} MB\n"
+            f"  Target occupancy : {overhead_factor * 100:.0f} %"
+        )
     return size
 
 
@@ -556,4 +560,4 @@ if __name__ == "__main__":
     best = select_device(db)
     if best:
         print()
-        n = batch(best)   # prints and returns; n holds the int
+        n = batch(best, debug=True)   # prints and returns; n holds the int

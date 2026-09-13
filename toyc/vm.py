@@ -18,6 +18,7 @@
 #   GpuVulkan.run("script.toyc")   → load compiled file, dispatch on GPU
 
 import os
+import time
 from typing import Any
 
 from .compiler import (
@@ -34,7 +35,7 @@ from .gpu.vulkan import GpuVulkan
 
 from .gpu.opengl import GpuOpengl
 
-__all__ = ["Cpu", "GpuVulkan"]
+__all__ = ["Cpu", "GpuVulkan", "GpuOpengl"]
 
 
 # ── Cpu: execute bytecode ─────────────────────────────────────────────────────
@@ -57,7 +58,8 @@ class Cpu:
     """
 
     @staticmethod
-    def run(program, env: dict = None, silent: bool = False) -> Any:
+    def run(program, env: dict = None, silent: bool = False,
+            timed: bool = False) -> Any:
         """
         Execute *program* and return the top-of-stack result.
 
@@ -74,17 +76,40 @@ class Cpu:
         silent : bool, optional
             False (default) → result is printed before returning.
             True            → result is returned quietly, no stdout output.
+        timed : bool, optional
+            False (default) → return just the result.
+            True            → print a timing report and return
+            ``(result, timing)``, where *timing* is a dict of seconds:
+            ``{"total", "resolve", "execute"}``.
 
         Examples
         --------
         Cpu.run("out.toyc")                        # prints result automatically
         value = Cpu.run("out.toyc", silent=True)   # capture only, no print
+        value, timing = Cpu.run("out.toyc", timed=True)  # + timing report
         """
+        t_start = time.perf_counter() if timed else 0.0
         instructions = Cpu._resolve(program)
+        t_resolved = time.perf_counter() if timed else 0.0
         result       = Cpu._execute(instructions, env or {})
+        t_end = time.perf_counter() if timed else 0.0
 
         if not silent:
             print(result)
+
+        if timed:
+            timing = {
+                "total":   t_end - t_start,
+                "resolve": t_resolved - t_start,
+                "execute": t_end - t_resolved,
+            }
+            print(
+                "[CPU timing] "
+                f"total={timing['total'] * 1e3:.3f} ms "
+                f"(resolve={timing['resolve'] * 1e3:.3f} ms, "
+                f"execute={timing['execute'] * 1e3:.3f} ms)"
+            )
+            return result, timing
 
         return result
 

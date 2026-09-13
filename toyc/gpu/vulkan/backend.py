@@ -1026,11 +1026,11 @@ class GpuVulkan:
                  directly without touching the GPU; anything else is
                  treated as a flat program buffer and dispatched once.
 
-        Returns the raw 4-byte result bytes (IEEE-754 float), or a
-        list of floats for batched runs; with timed=True returns
-        ``(result, timing)`` instead (*timing* holds seconds per stage:
-        ``{"total", "flatten", "select", "init", "exec",
-        "teardown", "decode"}`` — stages that did not run are 0.0).
+        Returns the decoded float value (or a list of floats for
+        batched runs); with timed=True returns ``(result, timing)``
+        instead (*timing* holds seconds per stage: ``{"total",
+        "flatten", "select", "init", "exec", "teardown", "decode"}`` —
+        stages that did not run are 0.0).
         Prints the decoded value(s) unless silent=True.
         Prints GPU diagnostics only when debug=True.
         Prints a timing report when timed=True.
@@ -1152,16 +1152,20 @@ class GpuVulkan:
                 "expected a .toy source or .toyc bytecode file"
             )
 
-        if not silent:
+        if isinstance(result, list):
+            value = result
+        else:
             value = struct.unpack("f", result)[0]
+
+        if not silent:
             print(value)
 
         if timed:
             timing["total"] = time.perf_counter() - t_start
             GpuVulkan._print_timing(timing)
-            return result, timing
+            return value, timing
 
-        return result
+        return value
 
     # ── public: run_batch ─────────────────────────────────────────────────────
 

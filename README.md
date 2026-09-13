@@ -65,7 +65,7 @@ Chunking at the recommended batch size is automatic. Singles → CPU
 
 ```python
 cpu_val, cpu_t = Cpu.run("program.toy", timed=True)
-gpu_raw, gpu_t = GpuVulkan.run("program.toy", timed=True)
+gpu_val, gpu_t = GpuVulkan.run("program.toy", timed=True)
 ```
 
 `toyc.bench` needs no loops from you — one equation + knobs, test

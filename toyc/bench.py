@@ -27,7 +27,6 @@ import csv
 import io
 import os
 import random
-import struct
 import tempfile
 
 from .lexer import Lexer, IDENT
@@ -180,10 +179,9 @@ def bench(program, backend, n, repeat, seed=None, verbose=False,
                     result, timing = _run_quiet(call, verbose)
                 else:
                     def call():
-                        raw, timing = GpuVulkan.run(
+                        return GpuVulkan.run(
                             prog, env=env, silent=True, debug=debug,
                             timed=True, cache=False)
-                        return struct.unpack("f", raw)[0], timing
                     result, timing = _run_quiet(call, verbose)
                 row = {
                     "backend":  backend,

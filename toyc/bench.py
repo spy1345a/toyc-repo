@@ -31,7 +31,8 @@ import tempfile
 from .lexer import Lexer, IDENT
 from .vm import Cpu, GpuVulkan
 
-__all__ = ["profile", "compare", "compare_batch", "to_csv"]
+__all__ = ["profile", "compare", "compare_batch", "summarize",
+             "to_csv"]
 
 # Union of every stage key both backends can report. Columns are always
 # present in the same order so CSVs concat cleanly.
@@ -130,6 +131,20 @@ def _cleanup_toy(prog: str) -> None:
         pass
 
 
+def _check_backends(backends, valid: tuple) -> list:
+    """Normalise the backends selector (str or sequence) and validate."""
+    if isinstance(backends, str):
+        backends = [backends]
+    backends = list(backends)
+    if not backends:
+        raise ValueError(f"backends must be a non-empty subset of {list(valid)}")
+    for b in backends:
+        if b not in valid:
+            raise ValueError(
+                f"unknown backend {b!r}; choose from {list(valid)}")
+    return backends
+
+
 def _label(program: str) -> str:
     """Short human-readable label for a program (expression text)."""
     if isinstance(program, str) and os.path.isfile(program):
@@ -148,9 +163,10 @@ def _row(backend: str, program: str, repeat: int,
     row = {
         "backend": backend,
         "program": _label(program),
-        "repeat":  repeat,
-        "result":  result,
-        "total":   timing.get("total"),
+        "n":        1,
+        "repeat":   repeat,
+        "result":   result,
+        "total":    timing.get("total"),
     }
     for stage in _STAGE_COLUMNS:
         row[stage] = timing.get(stage)
@@ -220,20 +236,30 @@ def profile(backend: str, program, env: dict = None, repeats: int = 3,
 
 
 def compare(programs, envs=None, repeats: int = 3,
+            backends=("cpu", "gpu"),
             debug: bool = False, verbose: bool = False) -> list[dict]:
     """
-    Profile each program on BOTH backends. *programs* is a list of
-    expressions / paths; *envs* an optional parallel list of env dicts
-    (or a single shared dict). Omit *envs* entirely to auto-collect
-    values from your Python variables::
+    Profile each program on the selected backends (default both).
+    *programs* is a list of expressions / paths; *envs* an optional
+    parallel list of env dicts (or a single shared dict). Omit *envs*
+    entirely to auto-collect values from your Python variables::
 
         a = 10
         b = 20
         compare(["1 + 2 * 7", "a + b * 2"], repeats=5)
 
-    Returns concatenated row-dicts, CPU rows first per program, ready
-    for ``pd.DataFrame(rows)``.
+    Pass ``backends=["cpu"]`` (or ``["gpu"]``) to run and save one
+    backend at a time instead of both together::
+
+        cpu_rows = compare(equations, backends=["cpu"])
+        to_csv(cpu_rows, "cpu.csv")
+        gpu_rows = compare(equations, backends=["gpu"])
+        to_csv(gpu_rows, "gpu.csv")
+
+    Returns concatenated row-dicts (one backend block per program, in
+    *backends* order), ready for ``pd.DataFrame(rows)``.
     """
+    backends = _check_backends(backends, ("cpu", "gpu"))
     if envs is None:
         # Plain loop (not a comprehension: comprehensions run in their
         # own frame, which would hide the caller's variables from
@@ -248,10 +274,43 @@ def compare(programs, envs=None, repeats: int = 3,
 
     rows: list[dict] = []
     for prog, env in zip(programs, envs):
-        rows += profile("cpu", prog, env=env, repeats=repeats)
-        rows += profile("gpu", prog, env=env, repeats=repeats,
-                        debug=debug, verbose=verbose)
+        for backend in backends:
+            rows += profile(backend, prog, env=env, repeats=repeats,
+                            debug=debug, verbose=verbose)
     return rows
+
+
+def summarize(rows: list[dict]) -> list[dict]:
+    """
+    Collapse row-dicts to one summary row per (backend, program):
+    ``backend, program, n, runs, mean_total, std_total, mean_per_eval,
+    mean_max_err`` (times in seconds). std over a single repeat is 0.0.
+    Handy for printing tables and for ``pd.DataFrame(summarize(rows))``.
+    """
+    import statistics
+    groups: dict = {}
+    for row in rows:
+        key = (row.get("backend"), row.get("program"))
+        groups.setdefault(key, []).append(row)
+    summary = []
+    for (backend, program), rs in groups.items():
+        totals = [r["total"] for r in rs]
+        per = [r["per_eval"] if r.get("per_eval") is not None
+               else r["total"] for r in rs]
+        errs = [r["max_err"] for r in rs
+                if r.get("max_err") is not None]
+        summary.append({
+            "backend":       backend,
+            "program":       program,
+            "n":             rs[0].get("n"),
+            "runs":          len(rs),
+            "mean_total":    statistics.mean(totals),
+            "std_total":     statistics.stdev(totals)
+                             if len(totals) > 1 else 0.0,
+            "mean_per_eval": statistics.mean(per),
+            "mean_max_err":  statistics.mean(errs) if errs else None,
+        })
+    return summary
 
 
 def to_csv(rows: list[dict], path: str) -> str:
@@ -322,25 +381,83 @@ def _as_env_sets(program, env_sets) -> list[dict]:
     return list(env_sets)
 
 
-def compare_batch(program, env_sets, repeats: int = 3,
+def _is_env_dict(obj) -> bool:
+    """True if *obj* is a single variable set (dict of scalar values)."""
+    return isinstance(obj, dict) and all(
+        not isinstance(v, (list, tuple)) for v in obj.values())
+
+
+def compare_batch(programs, env_sets, repeats: int = 3,
+                  backends=("cpu", "gpu-batch"),
                   debug: bool = False, verbose: bool = False) -> list[dict]:
     """
-    Profile ONE program over many variable sets: sequential ``Cpu.run``
+    Profile programs over many variable sets: sequential ``Cpu.run``
     loop ("cpu") versus data-parallel ``GpuVulkan.run_batch``
-    ("gpu-batch", one shader invocation per instance, chunked at the
-    recommended batch size).
+    ("gpu-batch", one shader invocation per instance).
 
-    *env_sets* is a list of env dicts, or a column dict of equal-length
-    value lists::
+    Pass ``backends=["cpu"]`` (or ``["gpu-batch"]``) to run and save
+    one backend at a time instead of both together::
+
+        cpu_rows = compare_batch(eq, sets, backends=["cpu"])
+        to_csv(cpu_rows, "batch_cpu.csv")
+        gpu_rows = compare_batch(eq, sets, backends=["gpu-batch"])
+        to_csv(gpu_rows, "batch_gpu.csv")
+
+    Single program::
 
         compare_batch("a + b * 2", [{"a": 1, "b": 2}, {"a": 3, "b": 4}])
-        compare_batch("a + b * 2", {"a": [1, 3], "b": [2, 4]})
+        compare_batch("a + b * 2", {"a": [1, 3], "b": [2, 4]})  # same
+
+    Multiple equations simply share the one list you pass — each
+    equation picks its own variables out of every set::
+
+        sets = [{"a": 1, "b": 2}, {"a": 3, "b": 4}]
+        compare_batch(["a + b", "a * b"], sets)   # both use both sets
+
+    Different sets per equation: pass one entry per program, each a
+    list of env dicts or a column dict::
+
+        compare_batch(["a + b", "a * b"],
+                      [[{"a": 1, "b": 2}], {"a": [1], "b": [2]}])
 
     Returns one row-dict per repeat per backend with ``n`` (instance
     count), ``total`` / ``per_eval`` seconds, ``max_err`` (max abs
-    GPU-vs-CPU difference; 0.0 on CPU rows, proving the GPU results),
-    plus per-stage columns — ready for ``pd.DataFrame(rows)``.
+    GPU-vs-CPU difference when both backends run, else None; 0.0 on
+    CPU rows, proving the GPU results), plus per-stage columns —
+    ready for ``pd.DataFrame(rows)``.
     """
+    backends = _check_backends(backends, ("cpu", "gpu-batch"))
+    if isinstance(programs, str):
+        return _compare_batch_one(programs, env_sets, repeats,
+                                  debug, verbose, backends)
+    if isinstance(env_sets, dict) or (
+            isinstance(env_sets, (list, tuple)) and len(env_sets) > 0
+            and all(_is_env_dict(e) for e in env_sets)):
+        # One shared sets-spec for every program: a column dict, or a
+        # plain list of env dicts (each equation picks the variables it
+        # needs out of every set).
+        shared = env_sets
+        rows: list[dict] = []
+        for prog in programs:
+            rows += _compare_batch_one(prog, shared, repeats,
+                                       debug, verbose, backends)
+        return rows
+    if len(env_sets) != len(programs):
+        raise ValueError(
+            "env_sets must be a column dict, a single list of env dicts "
+            "shared by all programs, or one entry per program "
+            f"(got {len(env_sets)} entries for {len(programs)} programs)"
+        )
+    rows = []
+    for prog, sets in zip(programs, env_sets):
+        rows += _compare_batch_one(prog, sets, repeats, debug, verbose,
+                                   backends)
+    return rows
+
+
+def _compare_batch_one(program, env_sets, repeats: int = 3,
+                       debug: bool = False, verbose: bool = False,
+                       backends=("cpu", "gpu-batch")) -> list[dict]:
     sets = _as_env_sets(program, env_sets)
     n = len(sets)
 
@@ -350,7 +467,8 @@ def compare_batch(program, env_sets, repeats: int = 3,
     else:
         prog, cleanup = program, False
 
-    GpuVulkan.startup(debug=debug)
+    if "gpu-batch" in backends:
+        GpuVulkan.startup(debug=debug)
 
     def _cpu_all():
         total = resolve = execute = 0.0
@@ -371,20 +489,29 @@ def compare_batch(program, env_sets, repeats: int = 3,
     rows: list[dict] = []
     try:
         for i in range(repeats):
+            results = {}
             if verbose:
-                cpu_vals, cpu_t = _cpu_all()
-                gpu_vals, gpu_t = _gpu_all()
+                if "cpu" in backends:
+                    results["cpu"] = _cpu_all()
+                if "gpu-batch" in backends:
+                    results["gpu-batch"] = _gpu_all()
             else:
                 with contextlib.redirect_stdout(io.StringIO()):
-                    cpu_vals, cpu_t = _cpu_all()
-                    gpu_vals, gpu_t = _gpu_all()
-            max_err = max(abs(g - c)
-                          for g, c in zip(gpu_vals, cpu_vals))
-            rows.append(_batch_row("cpu", program, n, i, cpu_t["total"],
-                                   cpu_t["total"] / n, 0.0, cpu_t))
-            rows.append(_batch_row("gpu-batch", program, n, i,
-                                   gpu_t["total"],
-                                   gpu_t["total"] / n, max_err, gpu_t))
+                    if "cpu" in backends:
+                        results["cpu"] = _cpu_all()
+                    if "gpu-batch" in backends:
+                        results["gpu-batch"] = _gpu_all()
+            if "cpu" in results and "gpu-batch" in results:
+                max_err = max(abs(g - c) for g, c in
+                              zip(results["gpu-batch"][0], results["cpu"][0]))
+            else:
+                max_err = None
+            for backend in backends:
+                values, timing = results[backend]
+                rows.append(_batch_row(
+                    backend, program, n, i, timing["total"],
+                    timing["total"] / n,
+                    0.0 if backend == "cpu" else max_err, timing))
     finally:
         if cleanup:
             _cleanup_toy(prog)

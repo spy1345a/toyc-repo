@@ -171,7 +171,7 @@ Dependency-free (stdlib only). Every call returns plain row-dicts —
 one per run — that drop straight into a DataFrame:
 
 ```python
-from toyc.bench import profile, compare, compare_batch, to_csv
+from toyc.bench import profile, compare, compare_batch, summarize, to_csv
 
 a = 10
 b = 20
@@ -186,9 +186,25 @@ df.groupby("backend")["total"].mean().plot.bar()   # CPU vs GPU
 | Function | What it does | Row columns |
 |----------|--------------|-------------|
 | `profile(backend, program, env?, repeats?, …)` | Repeat one program on `"cpu"` or `"gpu"` | `backend, program, repeat, result, total` + stage columns |
-| `compare(programs, envs?, repeats?, …)` | Each program on **both** backends | same as above, concatenated |
-| `compare_batch(program, env_sets, repeats?, …)` | One program over N sets: sequential CPU loop (`"cpu"`) vs `run_batch` (`"gpu-batch"`) | `backend, program, n, repeat, total, per_eval, max_err` + stage columns |
+| `compare(programs, envs?, repeats?, backends?, …)` | Each program on the selected backends (default both) | same as above, concatenated |
+| `compare_batch(programs, env_sets, repeats?, backends?, …)` | Program(s) over N sets: sequential CPU loop (`"cpu"`) vs `run_batch` (`"gpu-batch"`) | `backend, program, n, repeat, total, per_eval, max_err` + stage columns |
+| `summarize(rows)` | One summary row per (backend, program): `runs, mean_total, std_total, mean_per_eval, mean_max_err` | ready for `pd.DataFrame` or plain printing |
 | `to_csv(rows, path)` | Write rows to CSV (`pd.read_csv`-ready) | fixed column order |
+
+Run one backend at a time and save separately with
+`backends=["cpu"]` / `backends=["gpu"]` (or `["gpu-batch"]`).
+`max_err` needs both backends in one call — single-backend runs
+report it as `None` (no reference to compare against).
+
+`compare_batch` takes one equation or many. Pass **one** sets-spec
+(a list of env dicts or a column dict) and every equation automatically
+uses all of it; pass one entry per program for different sets:
+
+```python
+sets = [{"a": 1, "b": 2}, {"a": 3, "b": 4}]
+compare_batch(["a + b", "a * b"], sets)      # shared: both use both sets
+compare_batch("a + b * 2", {"a": [...], "b": [...]})  # one equation
+```
 
 - `env_sets` accepts a list of env dicts **or** a column dict of
   equal-length value lists: `{"a": [1, 3], "b": [2, 4]}`.

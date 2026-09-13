@@ -22,6 +22,17 @@ from ...parser import Parser
 # 10-second fence timeout in nanoseconds — generous for any real shader.
 _FENCE_TIMEOUT_NS = int(10e9)
 
+# Workgroup width of the data-parallel batch shader (comp_batch.glsl).
+_BATCH_GROUP = 64
+
+
+def _f2i(values: list[float]) -> list[int]:
+    """Bit-cast floats to int32s with ONE struct round-trip (bulk)."""
+    if not values:
+        return []
+    return list(struct.unpack(f"{len(values)}i",
+                              struct.pack(f"{len(values)}f", *values)))
+
 # ── persistent Vulkan session ───────────────────────────────────────────────
 # Creating a Vulkan instance + logical device + compute pipeline costs
 # ~15 ms on this hardware, while the actual dispatch is ~1 ms. So the
@@ -264,6 +275,22 @@ class GpuVulkan:
             queueFamilyIndex=qf_index,
         )
         cmd_pool = vk.vkCreateCommandPool(device, cmd_pool_info, None)
+        # One persistent primary command buffer, reset per dispatch.
+        cmd_alloc_info = vk.VkCommandBufferAllocateInfo(
+            sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            commandPool=cmd_pool,
+            level=vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            commandBufferCount=1,
+        )
+        cmd = vk.vkAllocateCommandBuffers(device, cmd_alloc_info)[0]
+        # One persistent fence, reset per dispatch.
+        fence = vk.vkCreateFence(
+            device,
+            vk.VkFenceCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            ),
+            None,
+        )
 
         # Descriptor set layout: one storage buffer binding.
         binding = vk.VkDescriptorSetLayoutBinding(
@@ -329,6 +356,29 @@ class GpuVulkan:
         pipeline       = _make_pipeline("comp")
         pipeline_batch = _make_pipeline("comp_batch")
 
+        # One persistent descriptor pool (reset per dispatch) plus its
+        # allocate-info, both referencing the session's pool + layout.
+        pool_size = vk.VkDescriptorPoolSize(
+            type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            descriptorCount=1,
+        )
+        desc_pool = vk.vkCreateDescriptorPool(
+            device,
+            vk.VkDescriptorPoolCreateInfo(
+                sType=vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                maxSets=1,
+                poolSizeCount=1,
+                pPoolSizes=[pool_size],
+            ),
+            None,
+        )
+        alloc_info = vk.VkDescriptorSetAllocateInfo(
+            sType=vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            descriptorPool=desc_pool,
+            descriptorSetCount=1,
+            pSetLayouts=[ds_layout],
+        )
+
         class _Vk:
             pass
 
@@ -338,16 +388,29 @@ class GpuVulkan:
         ctx.device          = device
         ctx.queue           = queue
         ctx.cmd_pool        = cmd_pool
+        ctx.cmd             = cmd
+        ctx.fence           = fence
         ctx.ds_layout       = ds_layout
         ctx.pipeline_layout = pipeline_layout
         ctx.pipeline        = pipeline
         ctx.pipeline_batch  = pipeline_batch
+        ctx.desc_pool       = desc_pool
+        ctx.alloc_info      = alloc_info
         ctx.qf_index        = qf_index
+        # Reusable scratch storage, grown on demand (None until first use).
+        ctx.scratch_buf  = None
+        ctx.scratch_mem  = None
+        ctx.scratch_size = 0
         return ctx
 
     @staticmethod
     def _destroy_vulkan(ctx) -> None:
         """Clean up all Vulkan handles created by _init_vulkan."""
+        if ctx.scratch_buf is not None:
+            vk.vkDestroyBuffer(ctx.device, ctx.scratch_buf, None)
+            vk.vkFreeMemory(ctx.device, ctx.scratch_mem, None)
+        vk.vkDestroyFence(ctx.device, ctx.fence, None)
+        vk.vkDestroyDescriptorPool(ctx.device, ctx.desc_pool, None)
         vk.vkDestroyPipeline(ctx.device, ctx.pipeline_batch, None)
         vk.vkDestroyPipeline(ctx.device, ctx.pipeline, None)
         vk.vkDestroyPipelineLayout(ctx.device, ctx.pipeline_layout, None)
@@ -401,17 +464,36 @@ class GpuVulkan:
         return buf, memory
 
     @staticmethod
+    def _ensure_scratch(ctx, size: int):
+        """
+        Return a reusable (buf, mem) pair holding at least *size* bytes,
+        growing the session's scratch storage on demand. Callers must
+        hold _CTX_LOCK (all dispatch paths do).
+        """
+        if ctx.scratch_buf is None or size > ctx.scratch_size:
+            if ctx.scratch_buf is not None:
+                vk.vkDestroyBuffer(ctx.device, ctx.scratch_buf, None)
+                vk.vkFreeMemory(ctx.device, ctx.scratch_mem, None)
+            buf, mem = GpuVulkan._create_buffer(
+                ctx, size,
+                vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            )
+            capacity = vk.vkGetBufferMemoryRequirements(
+                ctx.device, buf).size
+            ctx.scratch_buf  = buf
+            ctx.scratch_mem  = mem
+            ctx.scratch_size = capacity
+        return ctx.scratch_buf, ctx.scratch_mem
+
+    @staticmethod
     def _upload_flat(ctx, flat_data: list[int]):
-        """Pack flat_data as int32 and upload to a HOST_VISIBLE|HOST_COHERENT buffer."""
+        """Pack flat_data as int32 and upload to the scratch buffer."""
         packed = struct.pack(f"{len(flat_data)}i", *flat_data)
         size   = len(packed)
 
-        buf, mem = GpuVulkan._create_buffer(
-            ctx, size,
-            vk.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-        )
+        buf, mem = GpuVulkan._ensure_scratch(ctx, size)
 
         # vkMapMemory returns a cffi buffer (ffi.buffer) supporting the
         # buffer protocol — write via slice assignment, not ctypes.memmove.
@@ -429,115 +511,120 @@ class GpuVulkan:
         """
         Bind buf to a compute pipeline and dispatch x_groups workgroups.
 
+        Reuses the session's descriptor pool, command buffer and fence
+        (reset per dispatch) instead of recreating them every call.
+        Callers must hold _CTX_LOCK.
+
         A VkMemoryBarrier is inserted after vkCmdDispatch so the GPU write
         is visible to the CPU before we map and read back the result.
-
-        All transient Vulkan objects (descriptor pool, command buffer, fence)
-        are destroyed in finally blocks so nothing leaks on an exception.
         """
-        # ── descriptor pool + set ──────────────────────────────────────────
-        pool_size = vk.VkDescriptorPoolSize(
-            type=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        # ── descriptor set (pool reset, then re-allocated) ──────────────
+        vk.vkResetDescriptorPool(ctx.device, ctx.desc_pool, 0)
+        ds = vk.vkAllocateDescriptorSets(ctx.device, ctx.alloc_info)[0]
+        buffer_info = vk.VkDescriptorBufferInfo(
+            buffer=buf, offset=0, range=size,
+        )
+        write = vk.VkWriteDescriptorSet(
+            sType=vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            dstSet=ds,
+            dstBinding=0,
             descriptorCount=1,
+            descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            pBufferInfo=[buffer_info],
         )
-        pool_info = vk.VkDescriptorPoolCreateInfo(
-            sType=vk.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-            maxSets=1,
-            poolSizeCount=1,
-            pPoolSizes=[pool_size],
+        vk.vkUpdateDescriptorSets(ctx.device, 1, [write], 0, None)
+
+        # ── command buffer (persistent, reset per dispatch) ──────────────
+        cmd = ctx.cmd
+        vk.vkResetCommandBuffer(cmd, 0)
+        begin_info = vk.VkCommandBufferBeginInfo(
+            sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            flags=vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         )
-        pool = vk.vkCreateDescriptorPool(ctx.device, pool_info, None)
-        try:
-            alloc_info = vk.VkDescriptorSetAllocateInfo(
-                sType=vk.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                descriptorPool=pool,
-                descriptorSetCount=1,
-                pSetLayouts=[ctx.ds_layout],
-            )
-            ds = vk.vkAllocateDescriptorSets(ctx.device, alloc_info)[0]
-            buffer_info = vk.VkDescriptorBufferInfo(
-                buffer=buf, offset=0, range=size,
-            )
-            write = vk.VkWriteDescriptorSet(
-                sType=vk.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                dstSet=ds,
-                dstBinding=0,
-                descriptorCount=1,
-                descriptorType=vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                pBufferInfo=[buffer_info],
-            )
-            vk.vkUpdateDescriptorSets(ctx.device, 1, [write], 0, None)
+        vk.vkBeginCommandBuffer(cmd, begin_info)
+        vk.vkCmdBindPipeline(
+            cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            ctx.pipeline if pipeline is None else pipeline,
+        )
+        vk.vkCmdBindDescriptorSets(
+            cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
+            ctx.pipeline_layout, 0, 1, [ds], 0, None,
+        )
+        vk.vkCmdDispatch(cmd, x_groups, 1, 1)
 
-            # ── command buffer ─────────────────────────────────────────────
-            cmd_alloc_info = vk.VkCommandBufferAllocateInfo(
-                sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-                commandPool=ctx.cmd_pool,
-                level=vk.VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                commandBufferCount=1,
+        # Memory barrier: shader writes must be visible before CPU reads.
+        # Without this, RADV/AMDVLK can hand back stale cache contents.
+        barrier = vk.VkMemoryBarrier(
+            sType=vk.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            srcAccessMask=vk.VK_ACCESS_SHADER_WRITE_BIT,
+            dstAccessMask=vk.VK_ACCESS_HOST_READ_BIT,
+        )
+        vk.vkCmdPipelineBarrier(
+            cmd,
+            vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,  # srcStageMask
+            vk.VK_PIPELINE_STAGE_HOST_BIT,            # dstStageMask
+            0,                                         # dependencyFlags
+            1, [barrier],
+            0, None,
+            0, None,
+        )
+        vk.vkEndCommandBuffer(cmd)
+
+        # ── submit + wait (persistent fence, reset per dispatch) ────────
+        fence = ctx.fence
+        vk.vkResetFences(ctx.device, 1, [fence])
+        submit = vk.VkSubmitInfo(
+            sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            commandBufferCount=1,
+            pCommandBuffers=[cmd],
+        )
+        vk.vkQueueSubmit(ctx.queue, 1, [submit], fence)
+        vk_result = vk.vkWaitForFences(
+            ctx.device, 1, [fence], vk.VK_TRUE,
+            _FENCE_TIMEOUT_NS,
+        )
+        if vk_result == vk.VK_TIMEOUT:
+            raise RuntimeError(
+                "GPU compute timed out after "
+                f"{_FENCE_TIMEOUT_NS / 1e9:.0f} s"
             )
-            cmd = vk.vkAllocateCommandBuffers(ctx.device, cmd_alloc_info)[0]
-            try:
-                begin_info = vk.VkCommandBufferBeginInfo(
-                    sType=vk.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-                    flags=vk.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-                )
-                vk.vkBeginCommandBuffer(cmd, begin_info)
-                vk.vkCmdBindPipeline(
-                    cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-                    ctx.pipeline if pipeline is None else pipeline,
-                )
-                vk.vkCmdBindDescriptorSets(
-                    cmd, vk.VK_PIPELINE_BIND_POINT_COMPUTE,
-                    ctx.pipeline_layout, 0, 1, [ds], 0, None,
-                )
-                vk.vkCmdDispatch(cmd, x_groups, 1, 1)
-
-                # Memory barrier: shader writes must be visible before CPU reads.
-                # Without this, RADV/AMDVLK can hand back stale cache contents.
-                barrier = vk.VkMemoryBarrier(
-                    sType=vk.VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-                    srcAccessMask=vk.VK_ACCESS_SHADER_WRITE_BIT,
-                    dstAccessMask=vk.VK_ACCESS_HOST_READ_BIT,
-                )
-                vk.vkCmdPipelineBarrier(
-                    cmd,
-                    vk.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,  # srcStageMask
-                    vk.VK_PIPELINE_STAGE_HOST_BIT,            # dstStageMask
-                    0,                                         # dependencyFlags
-                    1, [barrier],
-                    0, None,
-                    0, None,
-                )
-                vk.vkEndCommandBuffer(cmd)
-
-                fence_info = vk.VkFenceCreateInfo(
-                    sType=vk.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-                )
-                fence = vk.vkCreateFence(ctx.device, fence_info, None)
-                try:
-                    submit = vk.VkSubmitInfo(
-                        sType=vk.VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                        commandBufferCount=1,
-                        pCommandBuffers=[cmd],
-                    )
-                    vk.vkQueueSubmit(ctx.queue, 1, [submit], fence)
-                    vk_result = vk.vkWaitForFences(
-                        ctx.device, 1, [fence], vk.VK_TRUE,
-                        _FENCE_TIMEOUT_NS,
-                    )
-                    if vk_result == vk.VK_TIMEOUT:
-                        raise RuntimeError(
-                            "GPU compute timed out after "
-                            f"{_FENCE_TIMEOUT_NS / 1e9:.0f} s"
-                        )
-                finally:
-                    vk.vkDestroyFence(ctx.device, fence, None)
-            finally:
-                vk.vkFreeCommandBuffers(ctx.device, ctx.cmd_pool, 1, [cmd])
-        finally:
-            vk.vkDestroyDescriptorPool(ctx.device, pool, None)
 
     # ── internal: source -> GPU buffer ────────────────────────────────────────
+
+    @staticmethod
+    def _classify(program: str) -> str:
+        """
+        Classify a program string as "toy" (.toy file), "toyc" (.toyc
+        file or magic bytes) or "inline" (expression source text).
+        Raises FileNotFoundError for missing .toy/.toyc paths and
+        ValueError for existing files of unknown type.
+        """
+        if program.endswith(".toy"):
+            if not os.path.isfile(program):
+                raise FileNotFoundError(
+                    f"Source file not found: {program!r}")
+            return "toy"
+        if program.endswith(".toyc"):
+            if not os.path.isfile(program):
+                raise FileNotFoundError(
+                    f"Bytecode file not found: {program!r}")
+            return "toyc"
+        if os.path.isfile(program):
+            if is_compiled_bytecode(program):
+                return "toyc"
+            raise ValueError(
+                f"Cannot load {program!r}: expected a .toy source, "
+                f".toyc file, or inline expression")
+        return "inline"
+
+    @staticmethod
+    def _flatten_source(source: str):
+        """Lex, parse and flatten source text. Returns the Flattener."""
+        tokens = Lexer.tokenize(source)
+        ast    = Parser.parse(tokens)
+        fl = flattener.Flattener()
+        fl.flatten(ast)
+        return fl
 
     @staticmethod
     def _to_flat(toy_path: str, env: dict = None) -> list[int]:
@@ -553,11 +640,12 @@ class GpuVulkan:
         """
         with open(toy_path, "r", encoding="utf-8") as f:
             source = f.read()
-        tokens = Lexer.tokenize(source)
-        ast    = Parser.parse(tokens)
+        return GpuVulkan._flat_from_source(source, env)
 
-        fl = flattener.Flattener()
-        fl.flatten(ast)
+    @staticmethod
+    def _flat_from_source(source: str, env: dict = None) -> list[int]:
+        """Flatten source text and pack the single-value GPU buffer."""
+        fl = GpuVulkan._flatten_source(source)
 
         flat_instrs  = fl.get_flat()
         const_values = fl.const_values
@@ -567,18 +655,15 @@ class GpuVulkan:
 
         buf = [n_instrs, n_consts, n_vars]
         buf.extend(flat_instrs)
-        for v in const_values:
-            buf.append(struct.unpack("i", struct.pack("f", float(v)))[0])
+        buf.extend(_f2i([float(v) for v in const_values]))
         if n_vars:
             env = env or {}
-            var_bits = [0] * n_vars
+            var_floats = [0.0] * n_vars
             for name, (_, var_idx) in fl.var_map.items():
                 if name not in env:
                     raise NameError(f"Undefined variable: {name!r}")
-                var_bits[var_idx] = struct.unpack(
-                    "i", struct.pack("f", float(env[name]))
-                )[0]
-            buf.extend(var_bits)
+                var_floats[var_idx] = float(env[name])
+            buf.extend(_f2i(var_floats))
         buf.append(0)  # output slot
         buf.append(0)  # error flag slot (0 ok, 1 division by zero)
 
@@ -605,11 +690,15 @@ class GpuVulkan:
             raise ValueError("run_batch needs at least one variable set")
         with open(toy_path, "r", encoding="utf-8") as f:
             source = f.read()
-        tokens = Lexer.tokenize(source)
-        ast    = Parser.parse(tokens)
+        return GpuVulkan._flat_batch_from_source(source, envs)
 
-        fl = flattener.Flattener()
-        fl.flatten(ast)
+    @staticmethod
+    def _flat_batch_from_source(source: str,
+                                envs: list[dict]) -> list[int]:
+        """Flatten source text and pack the data-parallel GPU buffer."""
+        if not envs:
+            raise ValueError("run_batch needs at least one variable set")
+        fl = GpuVulkan._flatten_source(source)
 
         flat_instrs  = fl.get_flat()
         const_values = fl.const_values
@@ -623,8 +712,8 @@ class GpuVulkan:
 
         buf = [n_instrs, n_consts, n_vars, n_inst]
         buf.extend(flat_instrs)
-        for v in const_values:
-            buf.append(struct.unpack("i", struct.pack("f", float(v)))[0])
+        buf.extend(_f2i([float(v) for v in const_values]))
+        var_floats = []
         for inst, env in enumerate(envs):
             env = env or {}
             for name in var_names:
@@ -633,8 +722,8 @@ class GpuVulkan:
                         f"Undefined variable: {name!r} "
                         f"(instance {inst} of {n_inst})"
                     )
-                buf.append(struct.unpack(
-                    "i", struct.pack("f", float(env[name])))[0])
+                var_floats.append(float(env[name]))
+        buf.extend(_f2i(var_floats))
         for _ in range(n_inst):
             buf.append(0)  # output slots
         buf.append(0)  # shared error flag slot
@@ -681,21 +770,18 @@ class GpuVulkan:
         size     = len(chunk) * 4          # bytes
         buf, mem = GpuVulkan._upload_flat(ctx, chunk)
 
+        # NOTE: buf/mem are the session's reusable scratch storage — they
+        # are NOT destroyed here (only grown, and freed at shutdown).
+        GpuVulkan._run_compute(ctx, buf, size, x_groups=1)
+
+        # Map the whole buffer, read the output slot and the error
+        # flag by header-derived offsets, copy them out before unmapping.
+        mapped = vk.vkMapMemory(ctx.device, mem, 0, size, 0)
         try:
-            GpuVulkan._run_compute(ctx, buf, size, x_groups=1)
-
-            # Map the whole buffer, read the output slot and the error
-            # flag by header-derived offsets, copy them out before unmapping.
-            mapped = vk.vkMapMemory(ctx.device, mem, 0, size, 0)
-            try:
-                out_bytes = bytes(mapped[out_idx * 4 : out_idx * 4 + 4])
-                err = struct.unpack("i", mapped[err_idx * 4 : err_idx * 4 + 4])[0]
-            finally:
-                vk.vkUnmapMemory(ctx.device, mem)
-
+            out_bytes = bytes(mapped[out_idx * 4 : out_idx * 4 + 4])
+            err = struct.unpack("i", mapped[err_idx * 4 : err_idx * 4 + 4])[0]
         finally:
-            vk.vkDestroyBuffer(ctx.device, buf, None)
-            vk.vkFreeMemory(ctx.device, mem, None)
+            vk.vkUnmapMemory(ctx.device, mem)
 
         if err != 0:
             raise ZeroDivisionError("Division by zero in VM")
@@ -733,24 +819,21 @@ class GpuVulkan:
         size     = len(chunk) * 4          # bytes
         buf, mem = GpuVulkan._upload_flat(ctx, chunk)
 
+        # NOTE: buf/mem are the session's reusable scratch storage — they
+        # are NOT destroyed here (only grown, and freed at shutdown).
+        groups = (n_inst + _BATCH_GROUP - 1) // _BATCH_GROUP
+        GpuVulkan._run_compute(ctx, buf, size, x_groups=groups,
+                               pipeline=ctx.pipeline_batch)
+
+        mapped = vk.vkMapMemory(ctx.device, mem, 0, size, 0)
         try:
-            groups = (n_inst + _BATCH_GROUP - 1) // _BATCH_GROUP
-            GpuVulkan._run_compute(ctx, buf, size, x_groups=groups,
-                                   pipeline=ctx.pipeline_batch)
-
-            mapped = vk.vkMapMemory(ctx.device, mem, 0, size, 0)
-            try:
-                out = [struct.unpack("f", mapped[(out_base + i) * 4:
-                                                 (out_base + i) * 4 + 4])[0]
-                       for i in range(n_inst)]
-                err = struct.unpack("i", mapped[err_idx * 4:
-                                                err_idx * 4 + 4])[0]
-            finally:
-                vk.vkUnmapMemory(ctx.device, mem)
-
+            out = [struct.unpack("f", mapped[(out_base + i) * 4:
+                                             (out_base + i) * 4 + 4])[0]
+                   for i in range(n_inst)]
+            err = struct.unpack("i", mapped[err_idx * 4:
+                                            err_idx * 4 + 4])[0]
         finally:
-            vk.vkDestroyBuffer(ctx.device, buf, None)
-            vk.vkFreeMemory(ctx.device, mem, None)
+            vk.vkUnmapMemory(ctx.device, mem)
 
         if err != 0:
             raise ZeroDivisionError("Division by zero in VM")
@@ -811,13 +894,18 @@ class GpuVulkan:
     def compile(program: str, env: dict = None, debug: bool = False,
                 timed: bool = False) -> str:
         """
-        Evaluate a .toy source file on the GPU and write the 4-byte
-        result as a sibling .toyc file.
+        Evaluate a .toy source file on the GPU and write the result as
+        a sibling .toyc file: 4-byte result for a single *env* dict,
+        result list for a list of env dicts (auto-batched via
+        compile_batch).
         Returns the path of the written .toyc file, or
         ``(path, timing)`` when timed=True (*timing* holds seconds per
         stage: ``{"total", "flatten", "select", "init", "exec",
-        "teardown"}``).
+        "teardown"}``, plus ``"n"`` for batches).
         """
+        if isinstance(env, (list, tuple)):
+            return GpuVulkan.compile_batch(program, list(env),
+                                           debug=debug, timed=timed)
         if not program.endswith(".toy"):
             raise ValueError(f"Expected a .toy source file, got: {program!r}")
         if not os.path.isfile(program):
@@ -849,60 +937,35 @@ class GpuVulkan:
         return toyc_path
 
     @staticmethod
-    def compile_batch(program: str, env: dict = None, debug: bool = False,
+    def compile_batch(program: str, env=None, debug: bool = False,
                       timed: bool = False) -> str:
         """
-        Evaluate a .toy source file on the GPU and write the 4-byte
-        result as a sibling .toyc file.
+        Evaluate a .toy source file for many variable sets on the GPU
+        (same data-parallel engine as run_batch, chunking automatic)
+        and write the result list as a sibling .toyc file.
 
-        The whole flat program is dispatched at once: a single
-        expression's instructions, constants and variables share one
-        buffer header ([n_instrs, n_consts, n_vars]) and one register
-        file, so slicing the buffer into chunks and dispatching each
-        slice as an independent program would execute garbage. If the
-        buffer does not fit into the usable VRAM budget a clear error
-        is raised instead of silently producing wrong results.
+        *env* is one mapping per instance — a list of dicts, a single
+        dict (one instance), or None (one instance, no variables).
+        Accepts a
+        .toy source file like compile() — chunking, VRAM budget checks
+        and error semantics are handled automatically.
 
         Returns the path of the written .toyc file, or
         ``(path, timing)`` when timed=True (same timing dict as
-        compile()).
+        run_batch, including ``"n"``).
         """
         if not program.endswith(".toy"):
             raise ValueError(f"Expected a .toy source file, got: {program!r}")
         if not os.path.isfile(program):
             raise FileNotFoundError(f"Source file not found: {program!r}")
 
-        t_start = time.perf_counter() if timed else 0.0
-        flat_data = GpuVulkan._to_flat(program, env)
-        t_flat = time.perf_counter() if timed else 0.0
-
-        profile, _ = GpuVulkan._sel_gpu(debug=debug)
-        t_sel = time.perf_counter() if timed else 0.0
-        usable = int(profile.total_device_local_memory_bytes * 0.80)
-        if len(flat_data) * 4 > usable:
-            raise RuntimeError(
-                f"Program buffer ({len(flat_data) * 4} bytes) exceeds "
-                f"usable VRAM budget ({usable} bytes); splitting a single "
-                "program across dispatches is not supported."
-            )
-        with _CTX_LOCK:
-            ctx = GpuVulkan._get_ctx(profile, debug=debug)
-            t_init = time.perf_counter() if timed else 0.0
-            binary = GpuVulkan._gpu_process_chunk(ctx, flat_data)
-            t_exec = time.perf_counter() if timed else 0.0
+        results, timing = GpuVulkan._run_batch_core(
+            program, env, debug=debug, timed=timed)
 
         toyc_path = os.path.splitext(os.path.abspath(program))[0] + ".toyc"
-        write_bytecode(toyc_path, binary)
+        write_bytecode(toyc_path, results)
 
         if timed:
-            timing = {
-                "total":    time.perf_counter() - t_start,
-                "flatten":  t_flat - t_start,
-                "select":   t_sel - t_flat,
-                "init":     t_init - t_sel,
-                "exec":     t_exec - t_init,
-                "teardown": 0.0,
-            }
             GpuVulkan._print_timing(timing)
             return toyc_path, timing
         return toyc_path
@@ -911,23 +974,30 @@ class GpuVulkan:
 
     @staticmethod
     def run(program: str, env: dict = None, silent: bool = False,
-            debug: bool = False, timed: bool = False) -> Any:
+            debug: bool = False, timed: bool = False,
+            cache: bool = True) -> Any:
         """
-        Run a .toy or .toyc file on the GPU.
-        .toy  -> flatten (with env for variables), single dispatch, cache
-                 the 4-byte result in a sibling .toyc, then return it.
-        .toyc -> if it holds a cached 4-byte result (written by compile()
-                 or a previous run()), decode it directly without touching
-                 the GPU; otherwise treat it as a flat program buffer and
-                 dispatch it once.
+        Run a .toy or .toyc file — or an inline expression — on the GPU.
+        .toy  -> single *env* dict: flatten, single dispatch, cache the
+                 4-byte result in a sibling .toyc, then return it.
+                 list of env dicts: auto-batched via run_batch (one
+                 float per instance, sibling .toyc holds the list).
+        "1+2" -> inline expression: same as .toy but nothing is written
+                 to disk.
+        .toyc -> cached 4-byte scalar result, or cached batch result
+                 list (both written by compile()/run()) — decoded
+                 directly without touching the GPU; anything else is
+                 treated as a flat program buffer and dispatched once.
 
-        Returns the raw 4-byte result bytes (IEEE-754 float), or
-        ``(result, timing)`` when timed=True (*timing* holds seconds per
-        stage: ``{"total", "flatten", "select", "init", "exec",
+        Returns the raw 4-byte result bytes (IEEE-754 float), or a
+        list of floats for batched runs; with timed=True returns
+        ``(result, timing)`` instead (*timing* holds seconds per stage:
+        ``{"total", "flatten", "select", "init", "exec",
         "teardown", "decode"}`` — stages that did not run are 0.0).
-        Prints the decoded float value unless silent=True.
+        Prints the decoded value(s) unless silent=True.
         Prints GPU diagnostics only when debug=True.
         Prints a timing report when timed=True.
+        Pass cache=False in hot loops to skip the sibling .toyc write.
 
         The shared GPU session is reused across calls and is never torn
         down here — call startup() once upfront to warm it, shutdown()
@@ -938,6 +1008,12 @@ class GpuVulkan:
                 f"GpuVulkan.run() expects a file path str, "
                 f"got {type(program).__name__}"
             )
+
+        if isinstance(env, (list, tuple)):
+            # Batch of variable sets — the batching is automatic.
+            return GpuVulkan.run_batch(program, list(env), silent=silent,
+                                       debug=debug, timed=timed,
+                                       cache=cache)
 
         timing = {
             "total": 0.0, "flatten": 0.0, "select": 0.0, "init": 0.0,
@@ -956,9 +1032,22 @@ class GpuVulkan:
                 timing.update(flatten=t_flat - t_start, **stages)
             else:
                 result = GpuVulkan._eval_flat_once(flat_data, debug=debug)
-            # Cache the result next to the source for run(.toyc) callers.
-            toyc_path = os.path.splitext(os.path.abspath(program))[0] + ".toyc"
-            write_bytecode(toyc_path, result)
+            if cache:
+                # Cache the result next to the source for run(.toyc).
+                toyc_path = os.path.splitext(
+                    os.path.abspath(program))[0] + ".toyc"
+                write_bytecode(toyc_path, result)
+        elif not program.endswith(".toyc") and not os.path.isfile(program):
+            # Inline expression, e.g. GpuVulkan.run("1 + 2"). No file to
+            # cache next to, so nothing is written.
+            flat_data = GpuVulkan._flat_from_source(program, env)
+            t_flat = time.perf_counter() if timed else 0.0
+            if timed:
+                result, stages = GpuVulkan._eval_flat_timed(flat_data,
+                                                            debug=debug)
+                timing.update(flatten=t_flat - t_start, **stages)
+            else:
+                result = GpuVulkan._eval_flat_once(flat_data, debug=debug)
         elif program.endswith(".toyc") or (
             os.path.isfile(program) and is_compiled_bytecode(program)
         ):
@@ -989,6 +1078,20 @@ class GpuVulkan:
                     else:
                         result = GpuVulkan._eval_flat_once(instructions,
                                                            debug=debug)
+            elif isinstance(raw, list) and raw \
+                    and all(isinstance(x, float) for x in raw):
+                # Cached batch result list — no GPU dispatch needed.
+                t_dec = time.perf_counter() if timed else 0.0
+                result = list(raw)
+                if timed:
+                    timing["decode"] = time.perf_counter() - t_dec
+                if not silent:
+                    print(result)
+                if timed:
+                    timing["total"] = time.perf_counter() - t_start
+                    GpuVulkan._print_timing(timing)
+                    return result, timing
+                return result
             elif isinstance(raw, list) and raw and isinstance(raw[0], int):
                 if timed:
                     result, stages = GpuVulkan._eval_flat_timed(
@@ -1022,39 +1125,42 @@ class GpuVulkan:
     # ── public: run_batch ─────────────────────────────────────────────────────
 
     @staticmethod
-    def run_batch(program: str, envs: list[dict], silent: bool = False,
-                  debug: bool = False, timed: bool = False
-                  ) -> list[float] | tuple:
-        """
-        Evaluate a .toy expression for many variable sets, data-parallel:
-        one shader invocation per instance, dispatched in chunks of the
-        recommended batch size (see gpu_detect.batch).
-
-        Parameters
-        ----------
-        program : str
-            .toy source file path (variables come from *envs*).
-        envs : list[dict]
-            One variable mapping per instance, e.g.
-            ``[{"a": 1.0, "b": 2.0}, {"a": 3.0, "b": 4.0}]``.
-        silent : bool — print the result list unless True.
-        debug  : bool — print GPU diagnostics.
-        timed  : bool — print a timing report and return
-            ``(results, timing)``; *timing* holds seconds per stage plus
-            ``"n"`` (instance count).
-
-        Returns a list of one float per instance (in *envs* order).
-        Raises NameError for variables missing from an env dict and
-        ZeroDivisionError if ANY instance divides by zero — same
-        exceptions as the CPU backend.
-        """
-        if not isinstance(program, str) or not program.endswith(".toy"):
-            raise ValueError(
-                f"Expected a .toy source file, got: {program!r}")
-        if not os.path.isfile(program):
-            raise FileNotFoundError(f"Source file not found: {program!r}")
-        if not envs:
+    def _norm_envs(env) -> list[dict]:
+        """Normalise batch variable sets: None → [{}], dict → [dict]."""
+        if env is None:
+            return [{}]
+        if isinstance(env, dict):
+            return [env]
+        env = list(env)
+        if not env:
             raise ValueError("run_batch needs at least one variable set")
+        return env
+
+    @staticmethod
+    def _run_batch_core(program: str, env, debug: bool = False,
+                        timed: bool = False) -> tuple:
+        """
+        Shared engine for run_batch()/compile_batch(). Validates the
+        .toy program, normalises *env*, and evaluates every instance
+        in recommended-batch-size chunks on the shared session.
+        Returns ``(results, timing)``; *timing* holds seconds per stage
+        plus ``"n"``.
+        """
+        if not isinstance(program, str):
+            raise TypeError(
+                f"Batch program must be a .toy path or inline expression "
+                f"str, got {type(program).__name__}")
+        kind = GpuVulkan._classify(program)
+        if kind == "toyc":
+            raise ValueError(
+                f"run_batch needs source (.toy file or inline "
+                f"expression), got bytecode: {program!r}")
+        if kind == "inline":
+            source = program
+        else:
+            with open(program, "r", encoding="utf-8") as f:
+                source = f.read()
+        env = GpuVulkan._norm_envs(env)
 
         t_start = time.perf_counter() if timed else 0.0
         profile, batch_size = GpuVulkan._sel_gpu(debug=debug)
@@ -1067,10 +1173,11 @@ class GpuVulkan:
         with _CTX_LOCK:
             ctx = GpuVulkan._get_ctx(profile, debug=debug)
             t_init = time.perf_counter() if timed else 0.0
-            for off in range(0, len(envs), chunk_size):
-                chunk_envs = envs[off:off + chunk_size]
+            for off in range(0, len(env), chunk_size):
+                chunk_envs = env[off:off + chunk_size]
                 f0 = time.perf_counter() if timed else 0.0
-                flat = GpuVulkan._to_flat_batch(program, chunk_envs)
+                flat = GpuVulkan._flat_batch_from_source(source,
+                                                         chunk_envs)
                 if timed:
                     t_flatten += time.perf_counter() - f0
                 if len(flat) * 4 > usable:
@@ -1083,20 +1190,69 @@ class GpuVulkan:
                 if timed:
                     t_exec += time.perf_counter() - e0
 
+        timing = {
+            "total":    (time.perf_counter() - t_start) if timed else 0.0,
+            "flatten":  t_flatten,
+            "select":   (t_sel - t_start) if timed else 0.0,
+            "init":     (t_init - t_sel) if timed else 0.0,
+            "exec":     t_exec,
+            "teardown": 0.0,
+            "decode":   0.0,
+            "n":        len(env),
+        }
+        return results, timing
+
+    # ── public: run_batch ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def run_batch(program: str, env=None, silent: bool = False,
+                  debug: bool = False, timed: bool = False,
+                  cache: bool = True) -> list[float] | tuple:
+        """
+        Evaluate a .toy expression for many variable sets, data-parallel:
+        one shader invocation per instance, dispatched in chunks of the
+        recommended batch size (see gpu_detect.batch) — chunking is
+        automatic.
+
+        Parameters
+        ----------
+        program : str
+            .toy source file path or inline expression (variables come
+            from *env*).
+        env : list[dict] | dict | None
+            One variable mapping per instance, e.g.
+            ``[{"a": 1.0, "b": 2.0}, {"a": 3.0, "b": 4.0}]``; a single
+            dict runs one instance; None runs one instance with no
+            variables (constant expressions).
+        silent : bool — print the result list unless True.
+        debug  : bool — print GPU diagnostics.
+        timed  : bool — print a timing report and return
+            ``(results, timing)``; *timing* holds seconds per stage plus
+            ``"n"`` (instance count).
+        cache  : bool — write the result list to the sibling .toyc file
+            (.toy paths only; skipped for inline expressions, read back
+            without dispatch by run(".toyc")). Pass cache=False in hot
+            loops to skip disk I/O.
+
+        Returns a list of one float per instance (in *env* order).
+        Raises NameError for variables missing from an env dict and
+        ZeroDivisionError if ANY instance divides by zero — same
+        exceptions as the CPU backend.
+        """
+        results, timing = GpuVulkan._run_batch_core(
+            program, env, debug=debug, timed=timed)
+
+        if cache and not (
+                isinstance(program, str)
+                and GpuVulkan._classify(program) == "inline"):
+            toyc_path = os.path.splitext(os.path.abspath(program))[0] \
+                + ".toyc"
+            write_bytecode(toyc_path, results)
+
         if not silent:
             print(results)
 
         if timed:
-            timing = {
-                "total":    time.perf_counter() - t_start,
-                "flatten":  t_flatten,
-                "select":   t_sel - t_start,
-                "init":     t_init - t_sel,
-                "exec":     t_exec,
-                "teardown": 0.0,
-                "decode":   0.0,
-                "n":        len(envs),
-            }
             GpuVulkan._print_timing(timing)
             return results, timing
 

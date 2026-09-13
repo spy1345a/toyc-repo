@@ -43,7 +43,7 @@ __all__ = ["Cpu", "GpuVulkan", "GpuOpengl"]
 class Cpu:
     """Stack-based virtual machine.
 
-    ``Cpu.run()`` accepts three forms of *program*:
+    ``Cpu.run()`` accepts these forms of *program*:
 
     1. ``list[Instr]``
           Already-compiled bytecode; executed directly, no I/O.
@@ -55,6 +55,10 @@ class Cpu:
     3. ``str`` ending in ``.toy``
           Read the source file, lex it, parse it, compile it in memory,
           then execute.  Nothing is written to disk.
+
+    4. any other ``str``
+          Treated as an inline expression (``Cpu.run("1 + 2")``),
+          lexed/parsed/compiled in memory.
     """
 
     @staticmethod
@@ -70,7 +74,8 @@ class Cpu:
         Parameters
         ----------
         program : list[Instr] | str
-            Bytecode list, a .toyc compiled file path, or a .toy source path.
+            Bytecode list, a .toyc compiled file path, a .toy source
+            path, or an inline expression string like ``"1 + 2"``.
         env : dict, optional
             Variable bindings available to LOAD instructions  {name: value}.
         silent : bool, optional
@@ -147,9 +152,14 @@ class Cpu:
         if os.path.isfile(path) and is_compiled_bytecode(path):
             return read_bytecode(path)
 
-        raise ValueError(
-            f"Cannot load {path!r}: expected a .toy source or .toyc bytecode file"
-        )
+        if os.path.isfile(path):
+            raise ValueError(
+                f"Cannot load {path!r}: expected a .toy source, "
+                f".toyc bytecode file, or an inline expression"
+            )
+
+        # ⑤ Inline expression, e.g. Cpu.run("1 + 2")
+        return Cpu._compile_source(program)
 
     @staticmethod
     def _compile_toy(toy_path: str) -> list:
@@ -160,6 +170,11 @@ class Cpu:
         with open(toy_path, "r", encoding="utf-8") as f:
             source = f.read()
 
+        return Cpu._compile_source(source)
+
+    @staticmethod
+    def _compile_source(source: str) -> list:
+        """Lex → parse → compile an inline expression string in memory."""
         tokens = Lexer.tokenize(source)
         ast    = Parser.parse(tokens)
         # path=None → memory only, no .toyc file created

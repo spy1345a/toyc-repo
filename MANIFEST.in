@@ -1,0 +1,3 @@
+# Ship the Vulkan shaders (sources + prebuilt SPIR-V) in sdists too,
+# so installs work without a GLSL compiler when .spv is up to date.
+recursive-include toyc/gpu/vulkan *.glsl *.spv

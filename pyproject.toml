@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "toyc"
-version = "0.2.3"
+version = "0.2.4"
 description = "A toy compiler with GPU backends (Vulkan + OpenGL)"
 readme = "README.md"
 license = { file = "toyc/LICENSE" }
@@ -33,6 +33,12 @@ Repository = "https://github.com/spy1345a/toyc-repo"
 [project.optional-dependencies]
 vulkan = ["vulkan"]     
 opengl = ["PyOpenGL"]
+
+# Shader binaries + sources must ship in the wheel, otherwise a
+# pip-installed copy has no .spv and is forced to recompile GLSL at
+# runtime (requiring glslangValidator/glslc on the user machine).
+[tool.setuptools.package-data]
+toyc = ["gpu/vulkan/*.glsl", "gpu/vulkan/*.spv"]
 
 [tool.pyrefly]
 search_path = [

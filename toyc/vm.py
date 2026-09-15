@@ -124,7 +124,7 @@ class Cpu:
     def _resolve(program) -> list:
         """Return a list[Instr] no matter what form *program* arrives in."""
 
-        # ① Already compiled in memory — use directly
+        # Already compiled in memory — use directly
         if isinstance(program, list):
             return program
 

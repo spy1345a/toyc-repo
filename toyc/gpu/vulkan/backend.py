@@ -914,6 +914,11 @@ class GpuVulkan:
     @staticmethod
     def _print_timing(timing: dict) -> None:
         """Print one-line GPU timing report (all values are seconds)."""
+        extra = ""
+        if "num_batches" in timing:
+            extra = (f" n={timing.get('n')} "
+                     f"batches={timing.get('num_batches')} "
+                     f"batch_size={timing.get('batch_size')}")
         print(
             "[GPU timing] "
             f"total={timing['total'] * 1e3:.3f} ms "
@@ -923,6 +928,7 @@ class GpuVulkan:
             f"exec={timing.get('exec', 0.0) * 1e3:.3f} ms, "
             f"teardown={timing.get('teardown', 0.0) * 1e3:.3f} ms, "
             f"decode={timing.get('decode', 0.0) * 1e3:.3f} ms)"
+            f"{extra}"
         )
 
     @staticmethod
@@ -1244,6 +1250,8 @@ class GpuVulkan:
             "teardown": 0.0,
             "decode":   0.0,
             "n":        len(env),
+            "num_batches": (len(env) + chunk_size - 1) // chunk_size,
+            "batch_size":  chunk_size,
         }
         return results, timing
 

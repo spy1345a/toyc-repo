@@ -83,7 +83,9 @@ pd.DataFrame(rows).groupby("backend")["total"].mean().plot.bar()
 ```
 
 Rows carry `backend, program, mode, n, repeat, total,
-total_time_taken, per_eval, check_err` + per-stage columns.
+total_time_taken, per_eval, check_err` + per-stage columns. Batch rows
+additionally carry `num_batches` (dispatch chunks used) and
+`batch_size` (instances per chunk).
 `summarize(rows)` collapses to one row per (backend, program).
 
 ## Semantics (CPU ≡ GPU)

@@ -195,6 +195,8 @@ def bench(program, backend, n, repeat, seed=None, verbose=False,
                     "total_time_taken": timing.get("total"),
                     "per_eval": timing.get("total"),
                     "check_err": None,
+                    "num_batches": None,
+                    "batch_size":  None,
                 }
                 row.update(_stages(timing))
                 rows.append(row)
@@ -215,7 +217,9 @@ def batch_bench(program, backend, n, repeat, seed=None, verbose=False,
 
     Returns one row-dict per repeat: ``backend, program,
     mode="batch", n, repeat, total, total_time_taken, per_eval``
-    (= total/n) plus per-stage columns. ``check_err`` on vulkan rows is the abs error of instance
+    (= total/n), ``num_batches`` (dispatch chunks used),
+    ``batch_size`` (instances per chunk) plus per-stage columns.
+    ``check_err`` on vulkan rows is the abs error of instance
     0 against a CPU reference run (None on cpu rows).
     """
     if isinstance(program, (list, tuple)):
@@ -267,6 +271,8 @@ def batch_bench(program, backend, n, repeat, seed=None, verbose=False,
                 "total_time_taken": timing.get("total"),
                 "per_eval":  timing.get("total") / n,
                 "check_err": check_err,
+                "num_batches": timing.get("num_batches"),
+                "batch_size":  timing.get("batch_size"),
             }
             row.update(_stages(timing))
             rows.append(row)
@@ -318,6 +324,8 @@ def summarize(rows: list) -> list:
             "mean_per_eval":  statistics.mean(per),
             "mean_check_err": statistics.mean(errs) if errs else None,
             "total_time_taken": sum(totals),
+            "num_batches":    rs[0].get("num_batches"),
+            "batch_size":     rs[0].get("batch_size"),
         })
     return summary
 
@@ -328,7 +336,7 @@ def to_csv(rows: list, path: str) -> str:
         raise ValueError("no rows to write")
     fieldnames = ["backend", "program", "mode", "n", "repeat", "inst", "result",
                   "total", "total_time_taken", "per_eval", "check_err",
-                  *_STAGE_COLUMNS]
+                  "num_batches", "batch_size", *_STAGE_COLUMNS]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames,
                                 extrasaction="ignore")

@@ -1,5 +1,6 @@
 import os
 import pickle
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,6 +50,30 @@ def _source_to_ast(toy_path: str):
     return Parser.parse(tokens)
 
 
+def _resolve_workers(workers) -> int:
+    """Normalise a workers argument: None/0 → all CPUs, else positive int."""
+    if workers is None or workers == 0:
+        return os.cpu_count() or 1
+    if isinstance(workers, bool) or not isinstance(workers, int) \
+            or workers < 1:
+        raise ValueError(
+            f"workers must be a positive int (or None/0 for all CPUs), "
+            f"got {workers!r}")
+    return workers
+
+
+def _item_to_node(item):
+    """Coerce a .toy path, inline source string, or AST node to an AST."""
+    if isinstance(item, str):
+        if item.endswith(".toy"):
+            if not os.path.isfile(item):
+                raise FileNotFoundError(f"Source file not found: {item!r}")
+            return _source_to_ast(item)
+        tokens = Lexer.tokenize(item)
+        return Parser.parse(tokens)
+    return item
+
+
 class Compiler:
     @staticmethod
     def compile(node_or_path, path: str = "out.toyc") -> list:
@@ -75,6 +100,31 @@ class Compiler:
             write_bytecode(path, instructions)
 
         return instructions
+
+    @staticmethod
+    def compile_many(items, workers=1) -> list:
+        """
+        Compile many programs in memory (nothing is written to disk).
+
+        *items* is a list of .toy paths, inline source strings, or AST
+        nodes. workers=1 runs sequentially; >1 (or None/0 = all CPUs)
+        compiles across a thread pool (lex/parse/emit touch no shared
+        state, so this is thread-safe).
+
+        Returns [list[Instr], ...] in input order.
+        """
+        items = list(items)
+        workers = _resolve_workers(workers)
+
+        def _one(item):
+            instructions: list[Instr] = []
+            Compiler._emit(_item_to_node(item), instructions)
+            return instructions
+
+        if workers == 1 or len(items) < 2:
+            return [_one(item) for item in items]
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            return list(ex.map(_one, items))
 
     @staticmethod
     def _emit(node, out: list) -> None:

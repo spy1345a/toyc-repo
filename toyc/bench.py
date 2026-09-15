@@ -154,7 +154,8 @@ def bench(program, backend, n, repeat, seed=None, verbose=False,
     Returns one row-dict per run: ``backend, program, mode="single",
     n, repeat, inst, result, total, total_time_taken, per_eval``
     (= total, one evaluation) plus per-stage columns (seconds, None
-    if N/A) — ready for ``pd.DataFrame(rows)``.
+    if N/A; ``threads``/``batch_index``/``chunk_n`` stay None on
+    single rows) — ready for ``pd.DataFrame(rows)``.
     Per-run printouts are suppressed unless ``verbose=True``.
     """
     if isinstance(program, (list, tuple)):
@@ -197,6 +198,9 @@ def bench(program, backend, n, repeat, seed=None, verbose=False,
                     "check_err": None,
                     "num_batches": None,
                     "batch_size":  None,
+                    "batch_index": None,
+                    "chunk_n":     None,
+                    "threads":     None,
                 }
                 row.update(_stages(timing))
                 rows.append(row)
@@ -207,20 +211,23 @@ def bench(program, backend, n, repeat, seed=None, verbose=False,
 
 
 def batch_bench(program, backend, n, repeat, seed=None, verbose=False,
-                debug=False) -> list:
+                debug=False, threads=None) -> list:
     """
     Run ONE equation over ``n`` instances per repeat on ``backend``
-    ("cpu" = sequential loop, "vulkan" = one data-parallel
-    ``run_batch`` dispatch, chunked automatically), repeating the whole
-    thing ``repeat`` times. Test values are auto-generated like in
-    bench().
+    ("cpu" or "vulkan"), repeating the whole thing ``repeat`` times.
+    Test values are auto-generated like in bench().
 
-    Returns one row-dict per repeat: ``backend, program,
-    mode="batch", n, repeat, total, total_time_taken, per_eval``
-    (= total/n), ``num_batches`` (dispatch chunks used),
-    ``batch_size`` (instances per chunk) plus per-stage columns.
-    ``check_err`` on vulkan rows is the abs error of instance
-    0 against a CPU reference run (None on cpu rows).
+    CPU rows (one per repeat): the loop runs on ``threads`` workers
+    (None = all CPUs, 1 = sequential) via Cpu.run_batch; the worker
+    count used lands in the ``threads`` column (None on vulkan rows).
+
+    Vulkan rows (one per dispatch chunk per repeat): each row records
+    ``batch_index`` (which chunk, 0-based), ``chunk_n`` (instances in
+    it), and that chunk's own flatten+exec time. ``num_batches`` /
+    ``batch_size`` describe the whole run. ``check_err`` is the abs
+    error of the chunk's first instance against a CPU reference run.
+
+    Ready for ``pd.DataFrame(rows)``.
     """
     if isinstance(program, (list, tuple)):
         raise ValueError(
@@ -240,42 +247,79 @@ def batch_bench(program, backend, n, repeat, seed=None, verbose=False,
         for r in range(repeat):
             if backend == "cpu":
                 def call():
-                    total = resolve = execute = 0.0
-                    for env in sets:
-                        out = Cpu.run(prog, env=env, silent=True,
-                                      timed=True)
-                        total   += out[1]["total"]
-                        resolve += out[1]["resolve"]
-                        execute += out[1]["execute"]
-                    return None, {"total": total, "resolve": resolve,
-                                  "execute": execute}
+                    return Cpu.run_batch(prog, sets, workers=threads,
+                                         silent=True, timed=True)
                 _, timing = _run_quiet(call, verbose)
-                check_err = None
+                rows.append({
+                    "backend":   backend,
+                    "program":   _label(program),
+                    "mode":      "batch",
+                    "n":         n,
+                    "repeat":    r,
+                    "batch_index": None,
+                    "chunk_n":     None,
+                    "inst":      None,
+                    "result":    None,
+                    "total":     timing.get("total"),
+                    "total_time_taken": timing.get("total"),
+                    "per_eval":  timing.get("total") / n,
+                    "check_err": None,
+                    "num_batches": None,
+                    "batch_size":  None,
+                    "threads":     timing.get("workers"),
+                    "resolve":     timing.get("resolve"),
+                    "execute":     timing.get("execute"),
+                    "flatten":   None,
+                    "select":    None,
+                    "init":      None,
+                    "exec":      None,
+                    "teardown":  None,
+                    "decode":    None,
+                })
             else:
                 def call():
                     return GpuVulkan.run_batch(
                         prog, sets, silent=True, debug=debug,
                         timed=True, cache=False)
                 values, timing = _run_quiet(call, verbose)
-                ref = Cpu.run(prog, env=sets[0], silent=True)
-                check_err = abs(values[0] - ref)
-            row = {
-                "backend":   backend,
-                "program":   _label(program),
-                "mode":      "batch",
-                "n":         n,
-                "repeat":    r,
-                "inst":      None,
-                "result":    None,
-                "total":     timing.get("total"),
-                "total_time_taken": timing.get("total"),
-                "per_eval":  timing.get("total") / n,
-                "check_err": check_err,
-                "num_batches": timing.get("num_batches"),
-                "batch_size":  timing.get("batch_size"),
-            }
-            row.update(_stages(timing))
-            rows.append(row)
+                chunks = timing.get("chunks") or [{
+                    "batch_index": 0, "chunk_n": n,
+                    "flatten": timing.get("flatten", 0.0) or 0.0,
+                    "exec":    timing.get("exec", 0.0) or 0.0,
+                }]
+                off = 0
+                for chunk in chunks:
+                    cn = chunk["chunk_n"]
+                    ctotal = (chunk.get("flatten") or 0.0) \
+                        + (chunk.get("exec") or 0.0)
+                    ref = Cpu.run(prog, env=sets[off], silent=True)
+                    rows.append({
+                        "backend":   backend,
+                        "program":   _label(program),
+                        "mode":      "batch",
+                        "n":         n,
+                        "repeat":    r,
+                        "batch_index": chunk.get("batch_index"),
+                        "chunk_n":     cn,
+                        "inst":      None,
+                        "result":    None,
+                        "total":     ctotal,
+                        "total_time_taken": ctotal,
+                        "per_eval":  ctotal / cn if cn else 0.0,
+                        "check_err": abs(values[off] - ref),
+                        "num_batches": timing.get("num_batches"),
+                        "batch_size":  timing.get("batch_size"),
+                        "threads":     None,
+                        "resolve":   None,
+                        "execute":   None,
+                        "flatten":   chunk.get("flatten"),
+                        "select":    None,
+                        "init":      None,
+                        "exec":      chunk.get("exec"),
+                        "teardown":  None,
+                        "decode":    None,
+                    })
+                    off += cn
     finally:
         if cleanup:
             _cleanup_toy(prog)
@@ -294,9 +338,9 @@ def summarize(rows: list) -> list:
     """
     Collapse row-dicts to one summary row per (backend, program):
     ``backend, program, mode, n, runs, mean_total, std_total,
-    mean_per_eval, mean_check_err, total_time_taken`` (times in
-    seconds; None where not applicable). ``total_time_taken`` is the
-    summed wall time of the whole group — the number to compare
+    mean_per_eval, mean_check_err, total_time_taken, threads`` (times
+    in seconds; None where not applicable). ``total_time_taken`` is
+    the summed wall time of the whole group — the number to compare
     backends by.
     Handy for printing tables and for ``pd.DataFrame(summarize(rows))``.
     """
@@ -326,6 +370,7 @@ def summarize(rows: list) -> list:
             "total_time_taken": sum(totals),
             "num_batches":    rs[0].get("num_batches"),
             "batch_size":     rs[0].get("batch_size"),
+            "threads":        rs[0].get("threads"),
         })
     return summary
 
@@ -336,7 +381,8 @@ def to_csv(rows: list, path: str) -> str:
         raise ValueError("no rows to write")
     fieldnames = ["backend", "program", "mode", "n", "repeat", "inst", "result",
                   "total", "total_time_taken", "per_eval", "check_err",
-                  "num_batches", "batch_size", *_STAGE_COLUMNS]
+                  "num_batches", "batch_size", "batch_index", "chunk_n",
+                  "threads", *_STAGE_COLUMNS]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames,
                                 extrasaction="ignore")

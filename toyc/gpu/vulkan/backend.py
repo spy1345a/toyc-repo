@@ -1220,6 +1220,7 @@ class GpuVulkan:
         usable = int(profile.total_device_local_memory_bytes * 0.80)
 
         results: list[float] = []
+        chunks: list[dict] = []
         t_flatten = t_exec = 0.0
         with _CTX_LOCK:
             ctx = GpuVulkan._get_ctx(profile, debug=debug)
@@ -1229,8 +1230,7 @@ class GpuVulkan:
                 f0 = time.perf_counter() if timed else 0.0
                 flat = GpuVulkan._flat_batch_from_source(source,
                                                          chunk_envs)
-                if timed:
-                    t_flatten += time.perf_counter() - f0
+                f1 = time.perf_counter() if timed else 0.0
                 if len(flat) * 4 > usable:
                     raise RuntimeError(
                         f"Batch chunk ({len(flat) * 4} bytes) exceeds "
@@ -1238,8 +1238,16 @@ class GpuVulkan:
                     )
                 e0 = time.perf_counter() if timed else 0.0
                 results.extend(GpuVulkan._gpu_process_batch(ctx, flat))
+                e1 = time.perf_counter() if timed else 0.0
+                chunks.append({
+                    "batch_index": off // chunk_size,
+                    "chunk_n":     len(chunk_envs),
+                    "flatten":     (f1 - f0) if timed else 0.0,
+                    "exec":        (e1 - e0) if timed else 0.0,
+                })
                 if timed:
-                    t_exec += time.perf_counter() - e0
+                    t_flatten += f1 - f0
+                    t_exec += e1 - e0
 
         timing = {
             "total":    (time.perf_counter() - t_start) if timed else 0.0,
@@ -1250,8 +1258,9 @@ class GpuVulkan:
             "teardown": 0.0,
             "decode":   0.0,
             "n":        len(env),
-            "num_batches": (len(env) + chunk_size - 1) // chunk_size,
+            "num_batches": len(chunks),
             "batch_size":  chunk_size,
+            "chunks":      chunks,
         }
         return results, timing
 

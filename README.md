@@ -83,10 +83,19 @@ pd.DataFrame(rows).groupby("backend")["total"].mean().plot.bar()
 ```
 
 Rows carry `backend, program, mode, n, repeat, total,
-total_time_taken, per_eval, check_err` + per-stage columns. Batch rows
-additionally carry `num_batches` (dispatch chunks used) and
-`batch_size` (instances per chunk).
+total_time_taken, per_eval, check_err` + per-stage columns. CPU batch
+rows add `threads` (workers used). GPU batch rows come one per chunk
+and add `num_batches` (chunks in the run), `batch_size` (instances
+per chunk), `batch_index` (which chunk, 0-based) and `chunk_n`
+(instances in it).
 `summarize(rows)` collapses to one row per (backend, program).
+
+CPU batch runs multithreaded automatically
+(`batch_bench(..., threads=None)` = all CPUs, `1` = sequential),
+and `Cpu.run_batch(prog, envs, workers=…)` / `Compiler.compile_many(
+items, workers=…)` expose the same control directly. Note: CPython
+threads share the GIL, so threaded CPU suits big batches and typically
+gains far less than the worker count — measure, don't assume.
 
 ## Semantics (CPU ≡ GPU)
 

@@ -19,6 +19,7 @@
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from .compiler import (
@@ -26,6 +27,7 @@ from .compiler import (
     Compiler,
     read_bytecode,
     is_compiled_bytecode,
+    _resolve_workers,
 )
 from .lexer  import Lexer
 from .parser import Parser
@@ -117,6 +119,66 @@ class Cpu:
             return result, timing
 
         return result
+
+    @staticmethod
+    def run_batch(program, envs=None, workers=1, silent=False,
+                  timed=False) -> Any:
+        """
+        Evaluate one *program* for many variable sets. The program is
+        resolved (lex+parse+compile) ONCE, then executed per env —
+        sequentially with workers=1 (default), or across a thread pool
+        with workers>1 (None/0 = all CPUs). Execution touches no shared
+        state (each call runs on its own stack), so threaded execution
+        is safe; results keep input order.
+
+        *envs* is one dict per instance (a single dict runs one
+        instance; None runs one instance with no variables).
+
+        Returns a result list, or (results, timing) with timed=True
+        (timing: total/resolve/execute seconds, plus n and workers).
+        """
+        if envs is None:
+            envs = [{}]
+        elif isinstance(envs, dict):
+            envs = [envs]
+        else:
+            envs = list(envs)
+        if not envs:
+            raise ValueError("Cpu.run_batch needs at least one variable set")
+        workers = _resolve_workers(workers)
+
+        t_start = time.perf_counter() if timed else 0.0
+        instructions = Cpu._resolve(program)
+        t_resolved = time.perf_counter() if timed else 0.0
+        if workers == 1 or len(envs) == 1:
+            results = [Cpu._execute(instructions, env or {})
+                       for env in envs]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                results = list(ex.map(
+                    lambda env: Cpu._execute(instructions, env or {}),
+                    envs))
+        t_end = time.perf_counter() if timed else 0.0
+
+        if not silent:
+            print(results)
+        if timed:
+            timing = {
+                "total":   t_end - t_start,
+                "resolve": t_resolved - t_start,
+                "execute": t_end - t_resolved,
+                "n":       len(envs),
+                "workers": workers,
+            }
+            print(
+                "[CPU batch timing] "
+                f"total={timing['total'] * 1e3:.3f} ms "
+                f"(resolve={timing['resolve'] * 1e3:.3f} ms, "
+                f"execute={timing['execute'] * 1e3:.3f} ms, "
+                f"n={timing['n']}, workers={timing['workers']})"
+            )
+            return results, timing
+        return results
 
     # ── input resolution ──────────────────────────────────────────────────────
 

@@ -79,11 +79,13 @@ rows = batch_bench("a + b * 2", backend="vulkan", n=2000, repeat=3)
 to_csv(rows, "timings.csv")
 
 import pandas as pd                       # your plotting, your deps
-pd.DataFrame(rows).groupby("backend")["total"].mean().plot.bar()
+pd.DataFrame(rows).groupby("backend")["total_time_taken"].mean().plot.bar()
 ```
 
 Rows carry `backend, program, mode, n, repeat, total,
-total_time_taken, per_eval, check_err` + per-stage columns. CPU batch
+total_time_taken, per_eval, check_err` + per-stage columns. Single
+rows hold one scalar in `result`; batch rows hold the first
+instance's value (same instance `check_err` validates). CPU batch
 rows add `threads` (workers used). GPU batch rows come one per chunk
 and add `num_batches` (chunks in the run), `batch_size` (instances
 per chunk), `batch_index` (which chunk, 0-based) and `chunk_n`

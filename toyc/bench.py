@@ -17,7 +17,7 @@
 #
 #     import pandas as pd
 #     df = pd.DataFrame(rows)
-#     df.groupby("backend")["total"].mean().plot.bar()
+#     df.groupby("backend")["total_time_taken"].mean().plot.bar()
 #
 # All timing values are SECONDS (perf_counter). Multiply by 1e3 for ms.
 # Stages that did not run in a given row are None (-> NaN in pandas).
@@ -192,7 +192,6 @@ def bench(program, backend, n, repeat, seed=None, verbose=False,
                     "repeat":   r,
                     "inst":     i,
                     "result":   result,
-                    "total":    timing.get("total"),
                     "total_time_taken": timing.get("total"),
                     "per_eval": timing.get("total"),
                     "check_err": None,
@@ -249,7 +248,7 @@ def batch_bench(program, backend, n, repeat, seed=None, verbose=False,
                 def call():
                     return Cpu.run_batch(prog, sets, workers=threads,
                                          silent=True, timed=True)
-                _, timing = _run_quiet(call, verbose)
+                cpu_vals, timing = _run_quiet(call, verbose)
                 rows.append({
                     "backend":   backend,
                     "program":   _label(program),
@@ -259,8 +258,7 @@ def batch_bench(program, backend, n, repeat, seed=None, verbose=False,
                     "batch_index": None,
                     "chunk_n":     None,
                     "inst":      None,
-                    "result":    None,
-                    "total":     timing.get("total"),
+                    "result":    _first_value(cpu_vals),
                     "total_time_taken": timing.get("total"),
                     "per_eval":  timing.get("total") / n,
                     "check_err": None,
@@ -302,8 +300,7 @@ def batch_bench(program, backend, n, repeat, seed=None, verbose=False,
                         "batch_index": chunk.get("batch_index"),
                         "chunk_n":     cn,
                         "inst":      None,
-                        "result":    None,
-                        "total":     ctotal,
+                        "result":    _first_value(values[off:off + cn]),
                         "total_time_taken": ctotal,
                         "per_eval":  ctotal / cn if cn else 0.0,
                         "check_err": abs(values[off] - ref),
@@ -324,6 +321,11 @@ def batch_bench(program, backend, n, repeat, seed=None, verbose=False,
         if cleanup:
             _cleanup_toy(prog)
     return rows
+
+
+def _first_value(values: list):
+    """First value of a result vector — one scalar for the table."""
+    return values[0] if values else None
 
 
 def _run_quiet(call, verbose: bool):
@@ -351,9 +353,9 @@ def summarize(rows: list) -> list:
         groups.setdefault(key, []).append(row)
     summary = []
     for (backend, program, mode), rs in groups.items():
-        totals = [r["total"] for r in rs]
+        totals = [r["total_time_taken"] for r in rs]
         per = [r["per_eval"] if r.get("per_eval") is not None
-               else r["total"] for r in rs]
+               else r["total_time_taken"] for r in rs]
         errs = [r["check_err"] for r in rs
                 if r.get("check_err") is not None]
         summary.append({
@@ -376,17 +378,21 @@ def summarize(rows: list) -> list:
 
 
 def to_csv(rows: list, path: str) -> str:
-    """Write row-dicts to *path* as CSV (pandas-readable). Returns path."""
+    """Append row-dicts to *path* as CSV (pandas-readable). Creates file if needed. Returns path."""
     if not rows:
         raise ValueError("no rows to write")
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     fieldnames = ["backend", "program", "mode", "n", "repeat", "inst", "result",
-                  "total", "total_time_taken", "per_eval", "check_err",
+                  "total_time_taken", "per_eval", "check_err",
                   "num_batches", "batch_size", "batch_index", "chunk_n",
                   "threads", *_STAGE_COLUMNS]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames,
-                                extrasaction="ignore")
-        writer.writeheader()
+    file_exists = os.path.isfile(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if not file_exists:
+            writer.writeheader()
         for row in rows:
             writer.writerow({k: ("" if v is None else v)
                              for k, v in row.items()

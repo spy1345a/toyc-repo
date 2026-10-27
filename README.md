@@ -82,6 +82,24 @@ import pandas as pd                       # your plotting, your deps
 pd.DataFrame(rows).groupby("backend")["total_time_taken"].mean().plot.bar()
 ```
 
+Pass `env=` to control the variable sets yourself instead of letting
+them be generated:
+
+```python
+# template dict: pin k at 5, sweep x (1.0–10.0, seeded)
+rows = bench("x / k", backend="cpu", n=100, repeat=5, seed=7,
+             env={"k": 5})
+
+# full list: every instance supplied outright, n becomes informational
+rows = batch_bench("x * k", backend="vulkan", n=3, repeat=2,
+                   env=[{"x": 1.0, "k": 4}, {"x": 2.0, "k": 4},
+                        {"x": 3.0, "k": 4}])
+```
+
+Every supplied env must define all variables the program uses
+(checked up front — same condition the backends raise `NameError`
+for), and pinned names are never re-randomized.
+
 Rows carry `backend, program, mode, n, repeat, total,
 total_time_taken, per_eval, check_err` + per-stage columns. Single
 rows hold one scalar in `result`; batch rows hold the first

@@ -4,13 +4,23 @@
 # batch_bench() for data-parallel batch runs.
 #
 # Both take ONE equation plus the required knobs — program, backend,
-# n, repeat — and generate the n test value sets themselves, so there
-# is nothing else to write::
+# n, repeat — and generate the n test value sets themselves (uniform
+# 1.0–10.0), so there is nothing else to write::
 #
 #     from toyc.bench import bench, batch_bench
 #
 #     rows = bench("a + b * 2", backend="cpu", n=100, repeat=5)
 #     rows = batch_bench("a + b * 2", backend="vulkan", n=2000, repeat=3)
+#
+# An optional ``env`` argument replaces the generator: a template dict
+# pins its names in every set (the rest stay auto-generated), and a
+# list of dicts supplies every instance outright::
+#
+#     rows = bench("x / k", backend="cpu", n=100, repeat=5, seed=7,
+#                  env={"k": 5})                       # pin k, sweep x
+#     rows = batch_bench("x * k", backend="vulkan", n=3, repeat=2,
+#                        env=[{"x": 1.0, "k": 4}, {"x": 2.0, "k": 4},
+#                             {"x": 3.0, "k": 4}])     # all supplied
 #
 # Everything is dependency-free (stdlib only). Each call returns plain
 # dict rows ready for pandas / plotting with zero conversion::
@@ -87,6 +97,65 @@ def _gen_sets(names: list, n: int, seed=None) -> list:
     return sets
 
 
+def _resolve_sets(names: list, n: int, seed, env) -> list:
+    """
+    Build the variable-set list handed to the backends.
+
+    ``env=None``      -> ``_gen_sets(names, n, seed)`` — auto-generated
+                         uniform 1.0–10.0 sets, unchanged behavior.
+    ``env=<dict>``    -> *template* mode: ``n`` copies of the dict, i.e.
+                         names present in it stay pinned at the exact
+                         user value in every set; the remaining (free)
+                         program variables are filled per instance via
+                         ``_gen_sets`` (seeded by ``seed``).
+    ``env=<list[dict]>`` -> the user supplies every instance outright;
+                         used as-is after validation (the caller derives
+                         the row count from ``len(sets)``).
+
+    Missing program variables in a supplied env raise ``ValueError``
+    here, before any timing runs (the backends raise ``NameError`` for
+    the same condition — this catches it earlier with a clearer
+    message). The resolved list length is always ``n`` except in list
+    mode, where it is ``len(env)``.
+    """
+    if env is None:
+        return _gen_sets(names, n, seed)
+
+    if isinstance(env, dict):
+        # Pinned names keep their exact value; only the free program
+        # variables are randomized (never re-randomize pinned values).
+        free = [name for name in names if name not in env]
+        sets = []
+        for extras in _gen_sets(free, n, seed):
+            s = dict(extras)
+            s.update(env)
+            sets.append(s)
+        return sets
+
+    # list[dict] (or other iterable of dict) → use as-is, validated.
+    if isinstance(env, str) or not hasattr(env, "__iter__"):
+        raise TypeError(
+            "env must be None, a dict (template), or a non-empty "
+            f"list of dicts; got {type(env).__name__}")
+    env_list = list(env)
+    if not env_list:
+        raise ValueError(
+            "env must not be empty; the backends need at least one "
+            "variable set")
+    for i, e in enumerate(env_list):
+        if not isinstance(e, dict):
+            raise TypeError(
+                f"env[{i}] must be a dict, got {type(e).__name__}")
+        for name in names:
+            if name not in e:
+                raise ValueError(
+                    f"env[{i}] is missing variable {name!r} used by "
+                    f"the program (the backends raise NameError for "
+                    f"this) — supply every variable in every env dict, "
+                    f"or pass a template dict instead")
+    return env_list
+
+
 def _temp_toy(expression: str) -> tuple:
     """Write *expression* to a temp .toy file. Returns (path, cleanup=True)."""
     tmp = tempfile.NamedTemporaryFile("w", suffix=".toy", delete=False)
@@ -144,12 +213,21 @@ def _stages(timing: dict) -> dict:
 
 
 def bench(program, backend, n, repeat, seed=None, verbose=False,
-          debug=False) -> list:
+          debug=False, env=None) -> list:
     """
     Run ONE equation ``n`` times per repeat (single-dispatch path) on
     ``backend`` ("cpu" or "vulkan"), repeating the whole thing
     ``repeat`` times. Test values are auto-generated (n sets, uniform
-    1.0–10.0; pass ``seed`` to reproduce them).
+    1.0–10.0; pass ``seed`` to reproduce them) unless ``env`` is given:
+
+    ``env=None``       auto-generate all n sets (default, as above).
+    ``env={...}``      one template dict: names present in it stay
+                       pinned at their exact value in all n sets, the
+                       remaining program variables are filled per
+                       instance (seeded by ``seed``).
+    ``env=[{...}, …]`` supplies every instance outright; ``n`` becomes
+                       informational (``len(env)`` drives the row count
+                       and the ``n`` column).
 
     Returns one row-dict per run: ``backend, program, mode="single",
     n, repeat, inst, result, total, total_time_taken, per_eval``
@@ -157,6 +235,13 @@ def bench(program, backend, n, repeat, seed=None, verbose=False,
     if N/A; ``threads``/``batch_index``/``chunk_n`` stay None on
     single rows) — ready for ``pd.DataFrame(rows)``.
     Per-run printouts are suppressed unless ``verbose=True``.
+
+    Examples
+    --------
+    rows = bench("x / k", backend="cpu", n=100, repeat=5, seed=7,
+                 env={"k": 5})                    # pin k, sweep x
+    rows = bench("x", backend="cpu", n=3, repeat=1,
+                 env=[{"x": 1.0}, {"x": 2.0}, {"x": 3.0}])
     """
     if isinstance(program, (list, tuple)):
         raise ValueError(
@@ -165,7 +250,8 @@ def bench(program, backend, n, repeat, seed=None, verbose=False,
     _check_backend(backend)
     _check_counts(n, repeat)
     names = _expr_names(program)
-    sets = _gen_sets(names, n, seed)
+    sets = _resolve_sets(names, n, seed, env)
+    n = len(sets)
     prog, cleanup = _prepare(program)
     if backend == "vulkan":
         GpuVulkan.startup(debug=debug)
@@ -210,11 +296,30 @@ def bench(program, backend, n, repeat, seed=None, verbose=False,
 
 
 def batch_bench(program, backend, n, repeat, seed=None, verbose=False,
-                debug=False, threads=None) -> list:
+                debug=False, threads=None, env=None) -> list:
     """
     Run ONE equation over ``n`` instances per repeat on ``backend``
     ("cpu" or "vulkan"), repeating the whole thing ``repeat`` times.
-    Test values are auto-generated like in bench().
+    Test values are auto-generated like in bench() unless ``env`` is
+    given — same three forms as there:
+
+    ``env=None``       auto-generate all n sets (default, uniform
+                       1.0–10.0; ``seed`` reproduces them).
+    ``env={...}``      one template dict: names present in it stay
+                       pinned at their exact value in every set, the
+                       remaining program variables are filled per
+                       instance (seeded by ``seed``).
+    ``env=[{...}, …]`` supplies every instance outright; the row count
+                       comes from ``len(env)`` and the ``n`` column
+                       reports it.
+
+    Examples
+    --------
+    rows = batch_bench("x * k", backend="vulkan", n=3, repeat=2,
+                       env=[{"x": 1.0, "k": 4}, {"x": 2.0, "k": 4},
+                            {"x": 3.0, "k": 4}])  # every instance
+    rows = batch_bench("x / k", backend="cpu", n=100, repeat=5,
+                       seed=7, env={"k": 5})       # pin k, sweep x
 
     CPU rows (one per repeat): the loop runs on ``threads`` workers
     (None = all CPUs, 1 = sequential) via Cpu.run_batch; the worker
@@ -236,7 +341,8 @@ def batch_bench(program, backend, n, repeat, seed=None, verbose=False,
     _check_backend(backend)
     _check_counts(n, repeat)
     names = _expr_names(program)
-    sets = _gen_sets(names, n, seed)
+    sets = _resolve_sets(names, n, seed, env)
+    n = len(sets)
     prog, cleanup = _prepare(program)
     if backend == "vulkan":
         GpuVulkan.startup(debug=debug)
